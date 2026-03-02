@@ -346,6 +346,20 @@ class Platform:
         return (current_capability.to_int() // 10) == (capability // 10)
 
     @classmethod
+    def is_blackwell_class(cls, device_id: int = 0) -> bool:
+        """
+        Returns True if the device is Blackwell-class (SM 10.x, 11.x, or 12.x).
+
+        Blackwell spans multiple SM families: GB200/B200 (SM10x), B100 (SM11x),
+        and GB10/Spark (SM12x). This helper avoids hardcoding a single major
+        version and is the recommended way to gate Blackwell-optimised paths.
+        """
+        current_capability = cls.get_device_capability(device_id=device_id)
+        if current_capability is None:
+            return False
+        return 10 <= current_capability.major <= 12
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         """Get the name of a device."""
         raise NotImplementedError
