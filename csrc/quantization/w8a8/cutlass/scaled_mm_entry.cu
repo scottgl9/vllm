@@ -195,7 +195,7 @@ void cutlass_scaled_mm(torch::Tensor& c, torch::Tensor const& a,
   int32_t version_num = get_sm_version_num();
 
 #if defined ENABLE_SCALED_MM_SM120 && ENABLE_SCALED_MM_SM120
-  if (version_num >= 120) {
+  if (version_num >= 120 && version_num < 130) {
     cutlass_scaled_mm_sm120(c, a, b, a_scales, b_scales, bias);
     return;
   }
