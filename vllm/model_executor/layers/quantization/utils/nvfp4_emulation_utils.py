@@ -125,16 +125,24 @@ def run_nvfp4_emulations(
     x_dq = (x_fp4 * x_blockscale).reshape(x_m, x_k).to(output_dtype)
     del x_fp4, x_blockscale
 
-    # dequantize weight
+    # dequantize weight - fixed for EMULATION backend on GB10
+    # Bug 1: Weight scales are LINEAR (not swizzled) in EMULATION mode
+    #   because convert_to_nvfp4_linear_kernel_format has no EMULATION case
+    # Bug 2: weight_global_scale may be inverted (1/actual_gs) by
+    #   compressed-tensors, but dequantize formula needs: w * scale / actual_gs
+    wgs = weight_global_scale
+    if wgs.numel() == 1 and wgs.item() < 1.0:
+        wgs = 1.0 / wgs
+
     w_fp4 = weight.data.view(torch.uint8)
-    w_dq = dequantize_to_dtype(
-        w_fp4,
-        weight_scale_swizzled.data,
-        weight_global_scale,
-        output_dtype,
-        x.device,
-        group_size,
-    )
+    m, packed_k = w_fp4.shape
+    k = packed_k * 2
+    tensor_f32 = break_fp4_bytes(w_fp4, torch.float32)
+    tensor_f32 = tensor_f32.reshape(m, k // group_size, group_size)
+    w_sf = weight_scale_swizzled.data.view(torch.float8_e4m3fn)
+    w_sf_linear = w_sf[:m, :k // group_size]
+    w_sf_dtype = w_sf_linear.to(torch.float32) / wgs
+    w_dq = (tensor_f32 * w_sf_dtype.unsqueeze(-1)).reshape(m, k).to(output_dtype)
 
     # matmul
     out = torch.matmul(x_dq, w_dq.t())
