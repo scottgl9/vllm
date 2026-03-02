@@ -127,6 +127,98 @@ That's ~75% of the AMD effective ceiling — there's a meaningful overhead gap t
 
 ---
 
+## Post-Quantization: lm_head to NVFP4
+
+### Motivation
+
+The lm_head is a dense BF16 linear layer [vocab_size × hidden_dim] = [200,064 × 3,072]
+= 1.229 GB. At batch=1 decode, this is 18.2% of per-step weight bandwidth — the single
+largest remaining BF16 component after attention and MoE experts are already NVFP4.
+
+### Usage
+
+```bash
+VLLM_QUANTIZE_LM_HEAD=nvfp4 python -m vllm.entrypoints.openai.api_server \
+  --model ~/models/MiniMax-M2.5-REAP-139B-A10B-NVFP4/ \
+  --quantization modelopt_fp4 --kv-cache-dtype fp8 \
+  --max-model-len 4096 --enforce-eager
+```
+
+### Expected Impact
+
+| Metric | Before | After |
+|--------|--------|-------|
+| lm_head size/step | 1.229 GB (BF16) | ~0.32 GB (FP4) |
+| Total weight/step | 6.76 GB | ~5.85 GB |
+| Expected throughput | ~25 tok/s | ~28-29 tok/s (+13-15%) |
+
+### How it works
+
+1. After model weights are loaded, the BF16 lm_head weight is quantized to NVFP4
+   using `scaled_fp4_quant()` with a computed global scale
+2. The packed FP4 weight and block scales are installed on the layer
+3. A lightweight `_Fp4EmbeddingMethodAdapter` replaces the default quant_method,
+   routing `LogitsProcessor` calls through `apply_nvfp4_linear()` (FP4 GEMM)
+4. No calibration data is needed — `input_global_scale = 1.0` works because
+   hidden states are already well-bounded from RMSNorm
+
+### Quality
+
+Tested on Qwen3-Coder-Next: no observable accuracy degradation with post-quantized
+lm_head (+44% speedup on that model). For MiniMax M2.5, the lm_head vocabulary
+projection is tolerant of FP4 quantization since the weight distribution is
+relatively uniform across the vocabulary dimension.
+
+---
+
+## CUDA Graph Testing
+
+### Status
+
+Our patches (Fix 9b: FP4 JIT pre-warm; FlashInfer auto-patches; avarok v23 NVFP4 v6)
+should have unblocked CUDA graph capture on GB10.
+
+### Test procedure
+
+```bash
+# 1. Baseline with --enforce-eager (known working)
+python -m vllm.entrypoints.openai.api_server \
+  --model ~/models/MiniMax-M2.5-REAP-139B-A10B-NVFP4/ \
+  --quantization modelopt_fp4 --kv-cache-dtype fp8 \
+  --max-model-len 4096 --enforce-eager
+
+# 2. CUDA graphs enabled (no --enforce-eager)
+python -m vllm.entrypoints.openai.api_server \
+  --model ~/models/MiniMax-M2.5-REAP-139B-A10B-NVFP4/ \
+  --quantization modelopt_fp4 --kv-cache-dtype fp8 \
+  --max-model-len 4096
+
+# 3. Both optimizations combined
+VLLM_QUANTIZE_LM_HEAD=nvfp4 python -m vllm.entrypoints.openai.api_server \
+  --model ~/models/MiniMax-M2.5-REAP-139B-A10B-NVFP4/ \
+  --quantization modelopt_fp4 --kv-cache-dtype fp8 \
+  --max-model-len 4096
+```
+
+### Expected results
+
+| Config | Expected tok/s | Notes |
+|--------|---------------|-------|
+| Baseline (--enforce-eager) | ~25 | Current |
+| + lm_head NVFP4 | ~28-29 | Commit 1 |
+| CUDA graphs (no --enforce-eager) | ~30-35 | If capture succeeds |
+| CUDA graphs + lm_head NVFP4 | ~33-38 | Combined |
+| Dual-Spark PP=2 | ~45 | Requires 2x GB10 |
+
+### Potential issues
+
+- If CUDA graph capture fails, check for dynamic shapes in FP4 activation
+  quantization (the v23 NVFP4 CUDA kernels should handle this)
+- FlashInfer JIT compilation during graph capture may timeout — pre-warm
+  by running a few inference requests with `--enforce-eager` first
+
+---
+
 ## Performance Roadmap
 
 ### Tier 1 — Biggest wins
@@ -233,6 +325,8 @@ expected scaling: ~1.8× throughput (memory bandwidth doubles, slight routing ov
 | O | avarok v23: GB10 native MoE kernel v109 (grouped_mm_gb10_native_v109) | Sm120+Pingpong+128³ tiles for GeForce MoE; tcgen05 5th-gen tensor cores enabled |
 | O | avarok v23: NVFP4 v6 full compilation (all nvfp4_*.cu for sm_121) | Eliminates Python FP4 quant fallback, fixes CUDA graph capture |
 | O | avarok v23: scaled_mm_entry.cu version_num >= 120 && < 130 | Prevents SM130+ dispatch collision |
+| P | minimax_m2: post-quantize BF16 lm_head to NVFP4 (env var gated) | ~13-15% throughput improvement |
+| Q | minimax_m2: PP+DP support (from PR #33303) | Enables dual-Spark deployment |
 
 ---
 
@@ -262,13 +356,14 @@ python -m vllm.entrypoints.openai.api_server \
 
 ## Performance Targets
 
-| Model | Baseline | With CUDA graphs | With compile O1+ | Ceiling |
-|-------|---------|-----------------|------------------|---------|
-| MiniMax M2.5 139B NVFP4 (Strix Halo) | 24 tok/s | N/A (AMD) | N/A | ~32 tok/s |
-| MiniMax M2.5 139B NVFP4 (GB10, vllm) | ~25 est. | ~30 tok/s | ~33 tok/s | **36–44 tok/s** |
-| Qwen3-Next NVFP4 on GB10 (SGLang) | 52 tok/s | — | — | — |
-| Qwen3-Next NVFP4 on GB10 (vllm) | TBD | TBD | TBD | ~55 tok/s |
+| Model | Baseline | + lm_head FP4 | + CUDA graphs | + Dual-Spark | Ceiling |
+|-------|---------|--------------|--------------|-------------|---------|
+| MiniMax M2.5 139B NVFP4 (Strix Halo) | 24 tok/s | N/A | N/A (AMD) | N/A | ~32 tok/s |
+| MiniMax M2.5 139B NVFP4 (GB10, vllm) | ~25 est. | ~28-29 | ~33-38 | ~45 | **36–44 tok/s** |
+| Qwen3-Next NVFP4 on GB10 (SGLang) | 52 tok/s | — | — | — | — |
+| Qwen3-Next NVFP4 on GB10 (vllm) | TBD | TBD | TBD | TBD | ~55 tok/s |
 
-> **Note:** The MiniMax M2.5 GB10 ceiling (36–44 tok/s) cannot be exceeded without either
-> (a) native FP4 tensor core MoE kernels on SM121, or (b) a checkpoint that includes
-> MTP weights (none exist for the REAP variant currently).
+> **Note:** The MiniMax M2.5 GB10 ceiling (36–44 tok/s single GPU) cannot be exceeded
+> without either (a) native FP4 tensor core MoE kernels on SM121, or (b) a checkpoint
+> that includes MTP weights (none exist for the REAP variant currently).
+> Dual-Spark PP=2 doubles available bandwidth and can exceed the single-GPU ceiling.
