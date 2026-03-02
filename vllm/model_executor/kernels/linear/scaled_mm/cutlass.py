@@ -149,6 +149,9 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     ) -> tuple[bool, str | None]:
         if not current_platform.is_cuda():
             return False, "requires CUDA."
+        # SM121 (GB10): CUTLASS FP8 has issues, use torch._scaled_mm fallback
+        if compute_capability == 121:
+            return False, "SM121 (GB10) uses torch._scaled_mm fallback."
         return True, None
 
     @classmethod
