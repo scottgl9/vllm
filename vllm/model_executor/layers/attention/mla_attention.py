@@ -440,10 +440,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.is_aiter_triton_fp8_bmm_enabled = rocm_aiter_ops.is_fp8bmm_enabled()
 
         # If kv_b_proj_weight is unquantized, quantize it to mxfp4 if supported
+        # Use getattr to avoid AttributeError when kv_b_proj uses quantized
+        # storage (e.g. NVFP4 Marlin repacks weights to int32).
+        _kv_b_w = getattr(self.kv_b_proj, "weight", None)
+        _kv_b_weight_dtype = _kv_b_w.dtype if _kv_b_w is not None else None
         self.is_aiter_triton_fp4_bmm_enabled = (
             rocm_aiter_ops.is_fp4bmm_enabled()
-            and hasattr(self.kv_b_proj, "weight")
-            and self.kv_b_proj.weight.dtype == torch.bfloat16
+            and _kv_b_weight_dtype == torch.bfloat16
         )
 
         # Attributes for forward_impl method
