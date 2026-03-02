@@ -64,6 +64,16 @@ if HAS_TRITON:
         )
         HAS_TRITON = False
 
+if HAS_TRITON:
+    # SM121 (GB10): Triton's bundled ptxas (CUDA 12.8) rejects sm_121a.
+    # Auto-set TRITON_PTXAS_PATH to the system ptxas if not already set.
+    if "TRITON_PTXAS_PATH" not in os.environ:
+        _system_ptxas = "/usr/local/cuda/bin/ptxas"
+        if os.path.isfile(_system_ptxas):
+            os.environ["TRITON_PTXAS_PATH"] = _system_ptxas
+            logger.debug("Auto-set TRITON_PTXAS_PATH=%s for SM121 compat",
+                         _system_ptxas)
+
 if not HAS_TRITON:
     logger.info(
         "Triton not installed or not compatible; certain GPU-related"
