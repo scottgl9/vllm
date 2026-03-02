@@ -62,6 +62,13 @@ def has_flashinfer() -> bool:
             "and not using pre-downloaded cubins"
         )
         return False
+    # On SM121 (GB10 Spark), patch FlashInfer headers before first JIT use.
+    try:
+        if current_platform.is_device_capability(121):
+            from vllm.utils.gb10_compat import ensure_flashinfer_sm121_compat
+            ensure_flashinfer_sm121_compat()
+    except Exception:
+        pass
     return True
 
 
