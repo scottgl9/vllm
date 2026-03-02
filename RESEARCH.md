@@ -6,7 +6,7 @@ PRs tracked during development of the `gb10-spark` branch.
 
 ## Implemented in This Branch
 
-| PR | Title | Commit |
+| PR / Source | Title | Commit |
 |----|-------|--------|
 | #35568 | Marlin SM121 capability check (`is_` → `has_`) | H |
 | #32704 | TRITON_PTXAS_PATH auto-configure | G |
@@ -16,6 +16,31 @@ PRs tracked during development of the `gb10-spark` branch.
 | #34822 | `is_blackwell_class()` + Blackwell attention backend priorities | N1 |
 | #35576 | MLA weight access crash for NVFP4/INT4 | N2 |
 | #34577 | NVFP4 weight scale BF16 underflow (marlin_utils_fp4) | N3 |
+| avarok v23 | SM121 native FP8 scaled_mm CUTLASS kernels (5 files) | O |
+| avarok v23 | GB10 native MoE kernel v109 (Pingpong+128³+tcgen05) | O |
+| avarok v23 | NVFP4 v6: all fp4 kernels compiled for sm_121 | O |
+| avarok v23 | scaled_mm_entry.cu dispatch fix (>= 120 && < 130) | O |
+| avarok v23 | ENABLE_TCGEN05_HARDWARE=1 for SM12.x | O |
+
+### avarok Container Source Analysis
+
+`avarok/dgx-vllm-nvfp4-kernel:v23` (Feb 2026) is the high-performance container.
+- Image label: `vllm_source = 3b30e6150-patched` (vLLM 0.16.0rc2.dev236)
+- Docker Hub: `avarok/dgx-vllm-nvfp4-kernel`
+- GitHub: `Avarok-Cybersecurity/dgx-vllm`
+
+Key env vars in v23:
+```
+ENABLE_TCGEN05_HARDWARE=1
+NVCC_PREPEND_FLAGS=-arch=sm_121a -DENABLE_TCGEN05_HARDWARE=1
+```
+
+Performance: **47 tok/s** for Qwen3-Coder-Next-FP8 (vs 43 tok/s in `vllm-dgx-spark:v11`).
+
+Root cause of 10% improvement: SM121 FP8 attention now uses Blackwell SM100 CUTLASS
+kernels (128×256×128 tiles, 1×1×1 cluster, KernelScheduleAuto) instead of PyTorch
+`torch._scaled_mm`. Plus `ENABLE_TCGEN05_HARDWARE=1` enables tcgen05 tensor core
+instructions in compiled CUTLASS kernels.
 
 ## Already Merged in HEAD (no action needed)
 
