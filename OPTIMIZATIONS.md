@@ -19,8 +19,11 @@ export NVCC_PREPEND_FLAGS="-arch=sm_121a"
 export CUDA_HOME=/usr/local/cuda
 
 pip install -e . --no-build-isolation -v 2>&1 | tee /tmp/vllm-gb10-build.log
-python scripts/gb10_post_install.py
 ```
+
+> **Note:** FlashInfer header patches (formerly `scripts/gb10_post_install.py`)
+> are now applied automatically at startup when SM121 is detected.  The script
+> is retained for manual/offline use only.
 
 ## Runtime Environment
 
@@ -45,8 +48,11 @@ export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 | H | Marlin SM121 capability check | Marlin W4A8-FP8 access |
 | I | GB10 MoE Triton config | +65% MoE throughput |
 | J | nv_fp4_dummy.h | CCCL FP4 type compat |
-| K | FlashInfer post-install patches | FlashInfer JIT compat |
+| K | FlashInfer auto-patches at startup | Replaces post-install script |
 | — | PR #35693: global scale init | Prevents +inf overflow |
+| N1 | PR #34822: is_blackwell_class() + attention backend priorities | SM12.x gets Blackwell-optimised attention |
+| N2 | PR #35576: MLA kv_b_proj.weight.dtype crash fix | Prevents AttributeError for NVFP4 MLA models |
+| N3 | PR #34577: NVFP4 scale BF16 underflow fix | Prevents zero scales / corrupted Marlin output |
 
 ## Smoke Tests
 
