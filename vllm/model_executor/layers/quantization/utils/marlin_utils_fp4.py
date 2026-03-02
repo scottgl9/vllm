@@ -41,7 +41,13 @@ def _nvfp4_compute_scale_factor(
 ) -> float:
     """Compute the power-of-2 scale_factor needed so that all non-zero
     values in marlin_scales * 2^7 are >= 2 after rescaling.
-    Returns a Python float (power of 2, >= 1.0)."""
+    Returns a Python float (power of 2, >= 1.0).
+
+    Must be called on scales in their original (pre-half-cast) precision:
+    BF16 per-channel scales can hold values below FP16's min normal
+    (~1.175e-38 vs ~6.1e-5) that would already have flushed to zero if the
+    tensor were cast to half beforehand, defeating any later rescaling.
+    """
 
     # Since half has a smaller dynamic range compared to bfloat16,
     # no rescaling is applied here if active dtype is half.
@@ -63,22 +69,14 @@ def nvfp4_marlin_process_scales(
     scale_factor: float | None = None,
     a_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, float]:
-    """Process NVFP4 weight scales into the special S0E5M3 format for Marlin.
+    """Process NVFP4 per-channel scales into Marlin S0E5M3 format.
 
-    Args:
-        marlin_scales: Weight scales tensor in half precision, already
-            permuted for the Marlin kernel layout.
-        scale_factor: Optional power-of-2 rescaling factor. If None, the
-            factor is computed automatically so that every non-zero scale
-            satisfies ``scale * 2^7 >= 2`` (i.e., the MSB of the S0E5M3
-            representation is always 1). When provided (e.g., for MoE
-            layers where all experts must share the same factor), the
-            given value is used directly. The caller is responsible for
-            dividing ``global_scale`` by the returned ``scale_factor`` to
-            preserve numerical correctness.
+    Returns (processed_scales, scale_factor).  The caller must divide
+    weight_global_scale by scale_factor to compensate for the BF16
+    underflow correction applied here.
 
-    Returns:
-        A tuple of (processed_scales, scale_factor).
+    If scale_factor is provided it is used directly; otherwise it is
+    computed from the input scales via _nvfp4_compute_scale_factor.
     """
     if not (marlin_scales >= 0).all():
         logger.warning_once(
@@ -88,8 +86,20 @@ def nvfp4_marlin_process_scales(
             "FP8-S0E5M3 format to speedup the dequantization."
         )
 
-    # convert to half first, we would convert to fp8 later
-    marlin_scales = marlin_scales.to(torch.half)
+    # Rescale weight_scale so that all non-zero values have MSB=1
+    # after multiplying by 2^7 (i.e., weight_scale * 2^7 >= 2).
+    # This is needed for models whose E4M3 scales were not normalized
+    # to fully utilize the E4M3 dynamic range (e.g., global_scale=1), and
+    # must run on the pre-half-cast tensor: BF16 scales can hold values
+    # that underflow to zero if cast to half first, before any rescaling
+    # has a chance to lift them.
+    # The caller must compensate by dividing global_scale by scale_factor.
+    if scale_factor is None:
+        scale_factor = _nvfp4_compute_scale_factor(marlin_scales, a_dtype)
+    if scale_factor > 1.0:
+        marlin_scales = (marlin_scales.float() * scale_factor).to(torch.half)
+    else:
+        marlin_scales = marlin_scales.to(torch.half)
 
     # fit the layout of fp8 dequantization
     marlin_scales = marlin_scales.view(-1, 4)[:, [0, 2, 1, 3]].view(
@@ -102,16 +112,6 @@ def nvfp4_marlin_process_scales(
     # After multiplying by 2 ** 7, the top bit of FP8-S0E5M3 would always be 1
     # when weight_scale > 0. This allows us to have an exponent bias
     # closer to zero after dequantization.
-
-    # Rescale weight_scale so that all non-zero values have MSB=1
-    # after multiplying by 2^7 (i.e., weight_scale * 2^7 >= 2).
-    # This is needed for models whose E4M3 scales were not normalized
-    # to fully utilize the E4M3 dynamic range (e.g., global_scale=1).
-    # The caller must compensate by dividing global_scale by scale_factor.
-    if scale_factor is None:
-        scale_factor = _nvfp4_compute_scale_factor(marlin_scales, a_dtype)
-    if scale_factor > 1.0:
-        marlin_scales = (marlin_scales.float() * scale_factor).to(torch.half)
 
     marlin_scales = marlin_scales * (2**7)
     marlin_scales[marlin_scales < 2] = 0
@@ -221,6 +221,13 @@ def apply_fp4_marlin_linear(
 def prepare_fp4_layer_for_marlin(
     layer: torch.nn.Module, input_dtype: torch.dtype | None = None
 ) -> None:
+    logger.warning_once(
+        "Your GPU does not have native support for FP4 computation but "
+        "FP4 quantization is being used. Weight-only FP4 compression will "
+        "be used leveraging the Marlin kernel. This may degrade "
+        "performance for compute-heavy workloads."
+    )
+
     is_nvfp4 = hasattr(layer, "weight_global_scale")
     if input_dtype is not None and input_dtype.itemsize == 1:
         if is_nvfp4:
@@ -469,6 +476,13 @@ def prepare_nvfp4_moe_layer_for_marlin(
 def prepare_moe_fp4_layer_for_marlin(
     layer: torch.nn.Module, input_dtype: torch.dtype | None = None
 ) -> None:
+    logger.warning_once(
+        "Your GPU does not have native support for FP4 computation but "
+        "FP4 quantization is being used. Weight-only FP4 compression will "
+        "be used leveraging the Marlin kernel. This may degrade "
+        "performance for compute-heavy workloads."
+    )
+
     is_nvfp4 = hasattr(layer, "w13_weight_scale_2")
     if input_dtype is not None and input_dtype.itemsize == 1:
         if is_nvfp4:
