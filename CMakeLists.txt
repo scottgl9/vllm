@@ -956,6 +956,94 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     message(STATUS "Building hadacore")
   endif()
 
+# ============================================================================
+# v115 FIX: Ensure dispatcher knows about SM_120 kernels
+# ============================================================================
+if(ENABLE_SCALED_MM_SM120 OR TARGET_SM120_BUILT)
+  set(DISPATCHER_FILE "csrc/quantization/w8a8/cutlass/scaled_mm_entry.cu")
+  set_source_files_properties(
+    ${DISPATCHER_FILE}
+    PROPERTIES
+    COMPILE_DEFINITIONS "ENABLE_SCALED_MM_SM120=1"
+  )
+  message(STATUS "v115: Set ENABLE_SCALED_MM_SM120=1 for ${DISPATCHER_FILE}")
+endif()
+
+# ============================================================================
+# SM_121 Native Scaled MM Kernels (GB10 - Compute Capability 12.1)
+# Uses Blackwell SM100 tensor core configs with 1×1×1 cluster (no multicast)
+# ============================================================================
+cuda_archs_loose_intersection(SM121_ARCHS "12.0f;12.1f" "${CUDA_ARCHS}")
+if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND SM121_ARCHS)
+  message(STATUS "Building SM_121 native scaled_mm kernels for: ${SM121_ARCHS}")
+  set(SM121_SRCS
+    "csrc/quantization/w8a8/cutlass/scaled_mm_c3x_sm121.cu"
+    "csrc/quantization/w8a8/cutlass/c3x/scaled_mm_sm121_fp8.cu"
+    "csrc/quantization/w8a8/cutlass/c3x/scaled_mm_blockwise_sm121_fp8.cu")
+  set_gencode_flags_for_srcs(
+    SRCS "${SM121_SRCS}"
+    CUDA_ARCHS "${SM121_ARCHS}")
+  list(APPEND VLLM_EXT_SRC "${SM121_SRCS}")
+  list(APPEND VLLM_GPU_FLAGS "-DENABLE_SCALED_MM_SM121=1")
+  message(STATUS "✓ SM_121 native scaled_mm kernels enabled")
+endif()
+
+# ============================================================================
+# GB10 Native MoE Kernel v109 (GeForce Blackwell - Pingpong + 128×128×128)
+# Based on NVIDIA CUTLASS example: 79d_blackwell_geforce_nvfp4_grouped_gemm.cu
+# Uses Sm120 ArchTag (GeForce), KernelPtrArrayTmaWarpSpecializedPingpong,
+# 128×128×128 tiles, 1×1×1 cluster — optimized for LPDDR5X unified memory.
+# ============================================================================
+if(SM121_ARCHS)
+  message(STATUS "Adding GB10 native MoE kernel v109 (GeForce-optimized): ${SM121_ARCHS}")
+  list(APPEND VLLM_EXT_SRC
+    "csrc/quantization/w8a8/cutlass/moe/grouped_mm_gb10_native_v109.cu")
+  list(APPEND VLLM_GPU_FLAGS "-DENABLE_CUTLASS_MOE_GB10_V109=1")
+  message(STATUS "✓ GB10 native MoE kernel v109 enabled")
+endif()
+
+# ============================================================================
+# ENABLE_TCGEN05_HARDWARE: Allow CUTLASS to use tcgen05 (5th-gen Tensor Cores)
+# on SM12.x (Blackwell GeForce). Required for best FP8/NVFP4 throughput.
+# ============================================================================
+if(SM121_ARCHS)
+  list(APPEND VLLM_GPU_FLAGS "-DENABLE_TCGEN05_HARDWARE=1")
+  message(STATUS "✓ tcgen05 hardware tensor core instructions enabled for SM121")
+endif()
+
+# ============================================================================
+# GB10 Full NVFP4 Compilation v6: compile ALL NVFP4 kernel files for SM121
+# Software E2M1 in nvfp4_utils.cuh enables quant kernels; MoE/scaled_mm use
+# CUTLASS BlockScaled MMA. Eliminates Python fallback + CUDA graph failures.
+# ============================================================================
+if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND SM121_ARCHS)
+  message(STATUS "GB10 NVFP4 v6: Compiling ALL NVFP4 kernels for sm_121")
+  set(GB10_NVFP4_KERNEL_FILES
+    "csrc/quantization/fp4/nvfp4_quant_kernels.cu"
+    "csrc/quantization/fp4/nvfp4_experts_quant.cu"
+    "csrc/quantization/fp4/activation_nvfp4_quant_fusion_kernels.cu"
+    "csrc/quantization/fp4/nvfp4_blockwise_moe_kernel.cu"
+    "csrc/quantization/fp4/nvfp4_scaled_mm_sm120_kernels.cu"
+  )
+  set(GB10_NVFP4_ENTRY_FILES
+    "csrc/quantization/fp4/nvfp4_quant_entry.cu"
+    "csrc/quantization/fp4/nvfp4_scaled_mm_entry.cu"
+  )
+  set(GB10_NVFP4_ALL_FILES ${GB10_NVFP4_ENTRY_FILES} ${GB10_NVFP4_KERNEL_FILES})
+  set_gencode_flags_for_srcs(
+    SRCS "${GB10_NVFP4_ALL_FILES}"
+    CUDA_ARCHS "12.1"
+  )
+  set_source_files_properties(
+    ${GB10_NVFP4_ALL_FILES}
+    PROPERTIES
+    COMPILE_DEFINITIONS "ENABLE_NVFP4_SM120=1"
+  )
+  # Kernel files are added via target_sources after define_extension_target
+  set(GB10_NVFP4_KERNEL_FILES_TO_ADD ${GB10_NVFP4_KERNEL_FILES})
+  message(STATUS "✓ GB10 NVFP4 v6: ALL kernels will compile for sm_121")
+endif()
+
 # if CUDA endif
 endif()
 
@@ -985,6 +1073,12 @@ define_extension_target(
 # driver API. This causes problems when linking with earlier versions of CUDA.
 # Setting this variable sidesteps the issue by calling the driver directly.
 target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
+
+# GB10 NVFP4 v6: add extra kernel files that need per-file arch/define settings
+if(DEFINED GB10_NVFP4_KERNEL_FILES_TO_ADD)
+  target_sources(_C PRIVATE ${GB10_NVFP4_KERNEL_FILES_TO_ADD})
+  message(STATUS "GB10 NVFP4 v6: Added ${GB10_NVFP4_KERNEL_FILES_TO_ADD} to _C target")
+endif()
 
 #
 # _moe_C extension
