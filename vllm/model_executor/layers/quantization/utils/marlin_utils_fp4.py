@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import math
+
 import torch
 
 import vllm._custom_ops as ops
@@ -27,7 +29,42 @@ def is_fp4_marlin_supported():
     return current_platform.has_device_capability(75)
 
 
-def nvfp4_marlin_process_scales(marlin_scales):
+def _nvfp4_compute_scale_factor(marlin_scales: torch.Tensor) -> float:
+    """Compute a power-of-2 factor that prevents FP16 underflow of BF16 scales.
+
+    NVFP4 per-channel weight scales may be stored in BF16.  When converted to
+    FP16 (min normal ~6.1e-5) very small BF16 values (representable down to
+    ~1.175e-38) flush to zero, corrupting the Marlin S0E5M3 dequantisation.
+
+    Returns the smallest power of 2 >= 1.0 that lifts the minimum positive
+    scale value above the FP16 underflow threshold.  The caller must divide
+    weight_global_scale by the same factor to keep the overall output unchanged.
+    """
+    nonzero = marlin_scales.float().abs()
+    nonzero = nonzero[nonzero > 0]
+    if nonzero.numel() == 0:
+        return 1.0
+    min_positive = nonzero.min().item()
+    fp16_min = torch.finfo(torch.float16).tiny  # ~6.1035e-5
+    if min_positive >= fp16_min:
+        return 1.0
+    k = math.ceil(math.log2(fp16_min / min_positive))
+    return float(2**k)
+
+
+def nvfp4_marlin_process_scales(
+    marlin_scales: torch.Tensor,
+    scale_factor: float | None = None,
+) -> tuple[torch.Tensor, float]:
+    """Process NVFP4 per-channel scales into Marlin S0E5M3 format.
+
+    Returns (processed_scales, scale_factor).  The caller must divide
+    weight_global_scale by scale_factor to compensate for the BF16
+    underflow correction applied here.
+
+    If scale_factor is provided it is used directly; otherwise it is
+    computed from the input scales via _nvfp4_compute_scale_factor.
+    """
     if not (marlin_scales >= 0).all():
         logger.warning_once(
             "NVFP4 Marlin assumes the scales to be >=0, but has encountered "
@@ -36,8 +73,12 @@ def nvfp4_marlin_process_scales(marlin_scales):
             "FP8-S0E5M3 format to speedup the dequantization."
         )
 
-    # convert to half first, we would convert to fp8 later
-    marlin_scales = marlin_scales.to(torch.half)
+    if scale_factor is None:
+        scale_factor = _nvfp4_compute_scale_factor(marlin_scales)
+
+    # Scale up before FP16 conversion to prevent underflow of small BF16 values.
+    # The caller compensates by dividing weight_global_scale by scale_factor.
+    marlin_scales = (marlin_scales.float() * scale_factor).to(torch.half)
 
     # fit the layout of fp8 dequantization
     marlin_scales = marlin_scales.view(-1, 4)[:, [0, 2, 1, 3]].view(
@@ -55,7 +96,7 @@ def nvfp4_marlin_process_scales(marlin_scales):
     marlin_scales = marlin_scales.view(torch.float8_e4m3fn)
     marlin_scales = marlin_scales[:, 1::2].contiguous()
 
-    return marlin_scales
+    return marlin_scales, scale_factor
 
 
 def mxfp4_marlin_process_scales(marlin_scales, input_dtype=None):
@@ -207,11 +248,12 @@ def prepare_fp4_layer_for_marlin(
     )
 
     if is_nvfp4:
-        weight_scale = nvfp4_marlin_process_scales(weight_scale)
+        weight_scale, scale_factor = nvfp4_marlin_process_scales(weight_scale)
         layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 
         weight_global_scale = layer.weight_global_scale.to(param_dtype)
         weight_global_scale = nvfp4_marlin_process_global_scale(weight_global_scale)
+        weight_global_scale = weight_global_scale / scale_factor
         layer.weight_global_scale = torch.nn.Parameter(
             weight_global_scale, requires_grad=False
         )
@@ -310,6 +352,9 @@ def prepare_nvfp4_moe_layer_for_marlin(
         else:
             size_n, size_k = K, N
 
+        # Compute a uniform scale_factor from all expert scales so that
+        # every expert's global scale is compensated by the same factor.
+        uniform_sf = _nvfp4_compute_scale_factor(scales)
         for i in range(E):
             scale = scales[i].T
             marlin_scales = marlin_permute_scales(
@@ -319,11 +364,14 @@ def prepare_nvfp4_moe_layer_for_marlin(
                 group_size=GROUP_SIZE,
                 is_a_8bit=is_a_8bit,
             )
-            marlin_scales = nvfp4_marlin_process_scales(marlin_scales)
+            marlin_scales, _ = nvfp4_marlin_process_scales(
+                marlin_scales, scale_factor=uniform_sf
+            )
             tensor_list.append(marlin_scales)
 
         scales = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
         g_scales = nvfp4_marlin_process_global_scale(g_scales)
+        g_scales = g_scales / uniform_sf
         return scales, g_scales
 
     w13_scale, w13_scale_2 = premute_scales(w13_scale, w13_scale_2, "w13")
@@ -408,6 +456,7 @@ def prepare_moe_fp4_layer_for_marlin(
         else:
             size_n, size_k = k, n
 
+        uniform_sf = _nvfp4_compute_scale_factor(scales) if is_nvfp4 else 1.0
         for i in range(e):
             scale = scales[i].T
 
@@ -419,7 +468,9 @@ def prepare_moe_fp4_layer_for_marlin(
                 is_a_8bit=is_a_8bit,
             )
             if is_nvfp4:
-                marlin_scales = nvfp4_marlin_process_scales(marlin_scales)
+                marlin_scales, _ = nvfp4_marlin_process_scales(
+                    marlin_scales, scale_factor=uniform_sf
+                )
             else:
                 marlin_scales = mxfp4_marlin_process_scales(
                     marlin_scales, input_dtype=input_dtype
@@ -432,6 +483,7 @@ def prepare_moe_fp4_layer_for_marlin(
 
         if is_nvfp4:
             global_scale = nvfp4_marlin_process_global_scale(global_scale)
+            global_scale = global_scale / uniform_sf
             global_scale = torch.nn.Parameter(global_scale, requires_grad=False)
             setattr(layer, name + "_weight_scale_2", global_scale)
 
@@ -502,9 +554,10 @@ def rand_marlin_weight_nvfp4_like(weight, group_size, input_dtype=None):
         group_size=group_size,
         is_a_8bit=is_a_8bit,
     )
-    marlin_scales = nvfp4_marlin_process_scales(marlin_scales)
+    marlin_scales, scale_factor = nvfp4_marlin_process_scales(marlin_scales)
 
     global_scale = nvfp4_marlin_process_global_scale(global_scale)
+    global_scale = global_scale / scale_factor
 
     return weight_ref.T, marlin_qweight, marlin_scales, global_scale
 
