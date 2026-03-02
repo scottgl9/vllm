@@ -417,6 +417,9 @@ class Qwen3_5Model(Qwen3NextModel):
             if name.startswith("mtp."):
                 continue
 
+            if "mlp.gate.weight" in name or "mlp.gate.bias" in name:
+                continue
+
             # Remapping the name of FP8 kv-scale.
             if name.endswith("scale"):
                 name = maybe_remap_kv_scale_name(name, params_dict)
