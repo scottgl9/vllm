@@ -90,6 +90,8 @@ def _get_backend_priorities(
     """Get backend priorities with lazy import to avoid circular dependency."""
     from vllm.utils.torch_utils import is_quantized_kv_cache
 
+    is_blackwell = 10 <= device_capability.major <= 12
+
     if use_mla:
         if device_capability.major == 10:
             # Sparse MLA backend priorities
@@ -144,8 +146,9 @@ def _get_backend_priorities(
     else:
         # SM100f defaults to FlashInfer for TRTLLM causal attention, but its non-causal
         # cutlass path (used for dflash attention) is known to have problems.
-        # So prefer FlashAttention when non-causal on SM100f.
-        if device_capability.major == 10 and not use_non_causal:
+        # So prefer FlashAttention when non-causal on SM100f (and SM12x, which shares
+        # the same cutlass path).
+        if is_blackwell and not use_non_causal:
             return [
                 AttentionBackendEnum.FLASHINFER,
                 AttentionBackendEnum.FLASH_ATTN,
