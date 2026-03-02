@@ -88,25 +88,45 @@ That's ~75% of the AMD effective ceiling — there's a meaningful overhead gap t
 
 ## Performance Roadmap
 
-### Tier 1 — Biggest wins (up to 3× combined)
+### Tier 1 — Biggest wins
 
-#### A. Enable MTP (Multi-Token Prediction)
-The MiniMax M2.5 REAP model ships with **3 MTP modules** — lightweight speculative
-decoder layers at indices 62–64 that predict 3 tokens ahead each step.
+#### A. MTP (Multi-Token Prediction) — status
 
-| Scenario | tok/s estimate |
-|----------|---------------|
-| Baseline (no MTP) | 24–30 |
-| MTP × 2 (70% acceptance, 2 draft tokens) | 48–60 |
-| MTP × 3 (70% acceptance, 3 draft tokens) | 57–75 |
+`config.json` says `num_mtp_modules: 3`, but **the checkpoint has no MTP weights**.
+`model.safetensors.index.json` only contains layers 0–61; layers 62–64 were dropped
+during the Cerebras REAP pruning/quantization process.
 
-**Blockers to fix first:**
-- PR #35041 — weight shape mismatch when using MTP + NVFP4 (OPEN, must integrate)
-- PR #35442 — 6ms CPU–GPU sync per MTP step → 200µs (OPEN, must integrate)
+MTP is therefore **unavailable for this specific checkpoint**.  If you want MTP:
+1. Download the full (unpruned) MiniMax M2.5 BF16 weights and re-quantize with MTP
+   layers included in the ignore list.
+2. Or wait for a REAP variant that preserves the MTP modules.
+
+PR #35442 (non-blocking MTP copy) was applied anyway — it helps Qwen3-Next-FP8
+and any other MTP-capable model you run on GB10.
+
+For MTP with the **original** MiniMax M2.5 (non-REAP), vllm would also need a
+`MiniMaxM2MTPModel` class (none exists currently — unlike DeepSeek, Qwen3Next, etc.)
 
 #### B. KV cache dtype
 Already using `--kv-cache-dtype fp8` (good). Keeping this reduces KV load bandwidth.
 At 96K context, KV cache = 62 layers × 2 × 8 heads × 128 dims × 1 byte × 96K tokens ≈ 12 GB.
+
+### Tier 1b — Validate CUDA graphs first (potentially +20–30%)
+
+#### Before anything else: test without `--enforce-eager`
+
+The NVIDIA forums reported that `--enforce-eager` was required on early GB10 vllm builds
+to avoid CUDA graph crashes.  Our patches (Fix 9b: FP4 JIT pre-warm; FlashInfer auto-patches)
+should unblock CUDA graph capture.  If graphs now work, removing `--enforce-eager` alone
+could give 20–30% throughput improvement by eliminating per-step kernel launch overhead
+across 62 attention + 62 MoE + 3 norm layers.
+
+```bash
+# Test CUDA graph (no --enforce-eager)
+python -m vllm.entrypoints.openai.api_server \
+  --model ~/models/MiniMax-M2.5-REAP-139B-A10B-NVFP4/ \
+  --quantization modelopt_fp4 --kv-cache-dtype fp8
+```
 
 ### Tier 2 — Medium wins (+15–30%)
 
@@ -197,9 +217,13 @@ python -m vllm.entrypoints.openai.api_server \
 
 ## Performance Targets
 
-| Model | Current | Target (no MTP) | Target (MTP) |
-|-------|---------|-----------------|--------------|
-| MiniMax M2.5 139B NVFP4 on Strix Halo | 24 tok/s | — | — |
-| MiniMax M2.5 139B NVFP4 on GB10 | ~25 tok/s est. | 33–36 tok/s | 50–75 tok/s |
-| Qwen3-Next NVFP4 on GB10 (SGLang) | 52 tok/s (sglang.mine) | — | — |
-| Qwen3-Next NVFP4 on GB10 (vllm) | TBD | 40–48 tok/s | TBD |
+| Model | Baseline | With CUDA graphs | With compile O1+ | Ceiling |
+|-------|---------|-----------------|------------------|---------|
+| MiniMax M2.5 139B NVFP4 (Strix Halo) | 24 tok/s | N/A (AMD) | N/A | ~32 tok/s |
+| MiniMax M2.5 139B NVFP4 (GB10, vllm) | ~25 est. | ~30 tok/s | ~33 tok/s | **36–44 tok/s** |
+| Qwen3-Next NVFP4 on GB10 (SGLang) | 52 tok/s | — | — | — |
+| Qwen3-Next NVFP4 on GB10 (vllm) | TBD | TBD | TBD | ~55 tok/s |
+
+> **Note:** The MiniMax M2.5 GB10 ceiling (36–44 tok/s) cannot be exceeded without either
+> (a) native FP4 tensor core MoE kernels on SM121, or (b) a checkpoint that includes
+> MTP weights (none exist for the REAP variant currently).
