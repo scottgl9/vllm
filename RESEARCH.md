@@ -103,12 +103,15 @@ At ~70% acceptance rate, this yields **~2–2.5x throughput** (24 → 48–60 to
 
 ---
 
-## MiniMax-Specific PRs (Cherry-pick Candidates)
+## MiniMax-Specific PRs
 
-| PR | Title | Notes |
-|----|-------|-------|
-| #33303 | MiniMax-M2 PP+DP parallelism | Dual-Spark scaling |
-| #33149 | MiniMax-M2 tool call parser | Streaming fix |
+| PR | Title | Status | Notes |
+|----|-------|--------|-------|
+| #33303 | MiniMax-M2 PP+DP parallelism | **Applied** (Commit Q) | Dual-Spark scaling |
+| #33149 | Tool call parser stream_interval fix | Open | Correctness |
+| #34863 | Compressed-tensors FP8 scale propagation | Open | Accuracy |
+| #32232 | MiniMax structural_tag support | Open | Structured output |
+| #35358 | Fix reasoning-end detection | Open | Parser fix |
 
 ---
 
