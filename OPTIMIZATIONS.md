@@ -41,6 +41,47 @@ export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 
 ---
 
+## avarok/dgx-vllm-nvfp4-kernel:v23 — Performance Analysis
+
+### Source
+Container label: `vllm_source = 3b30e6150-patched` (vLLM 0.16.0rc2.dev236).
+Patches extracted directly from running container via `docker run --rm ... git diff HEAD`.
+
+### Performance delta vs avarok/vllm-dgx-spark:v11
+- **Qwen3-Coder-Next-FP8**: 47 tok/s (v23) vs 43 tok/s (v11) = **+10%**
+- **NVFP4 MoE models**: additional gain from tcgen05 and native MoE kernel
+
+### What makes v23 faster
+
+| Feature | v23 | v11 (old) |
+|---------|-----|-----------|
+| FP8 attention GEMM | Blackwell SM100 CUTLASS kernels (1×1×1 cluster, 128×256×128 tiles) | PyTorch `torch._scaled_mm` fallback |
+| FP8 blockwise GEMM | Native `scaled_mm_blockwise_sm121_fp8` | PyTorch fallback |
+| NVFP4 activation quant | CUDA kernels for sm_121 (all 5 NVFP4 .cu files compiled) | Python software loop (CUDA graph-hostile) |
+| Tensor cores | tcgen05 5th-gen (`ENABLE_TCGEN05_HARDWARE=1`) | No tcgen05 flag |
+| MoE (FP8 models) | GB10 native v109: Sm120+Pingpong+128³ | Generic Triton fallback |
+| SM version dispatch | `>= 120 && < 130` (correct) | `>= 120` (catches SM130+) |
+
+### Key files added
+
+| File | Purpose |
+|------|---------|
+| `csrc/quantization/w8a8/cutlass/scaled_mm_c3x_sm121.cu` | Routes SM121 FP8 GEMMs to Blackwell SM100 kernels |
+| `csrc/quantization/w8a8/cutlass/c3x/scaled_mm_sm121_fp8.cu` | Per-tensor FP8 GEMM for SM121 |
+| `csrc/quantization/w8a8/cutlass/c3x/scaled_mm_blockwise_sm121_fp8.cu` | Blockwise FP8 GEMM for SM121 |
+| `csrc/quantization/w8a8/cutlass/moe/grouped_mm_gb10_native_v109.cu` | GeForce Blackwell MoE kernel (Pingpong schedule, adaptive tile) |
+
+### Why FP8 attention matters (Qwen3-Next-FP8 decode)
+
+At BS=1, each decode step loads:
+- FP8 attention QKV+O (62 layers × 4 matrices × 3072×3072 @ FP8): ~1.2 GB
+- FP8 MoE (8 active × 62 layers × intermediate=2048): ~2.8 GB
+- BF16 lm_head: ~1.5 GB
+
+Using CUTLASS SM100 kernels (vs PyTorch fallback) eliminates ~0.5–1 ms of CUDA kernel launch overhead per attention layer, adding up to ~3–5 ms per step → **~4 tok/s improvement at 47 tok/s throughput**.
+
+---
+
 ## MiniMax M2.5 REAP 139B NVFP4 — Bandwidth Analysis
 
 ### Model architecture
@@ -188,6 +229,10 @@ expected scaling: ~1.8× throughput (memory bandwidth doubles, slight routing ov
 | N1 | PR #34822: is_blackwell_class() + attention backend priorities | SM12.x gets Blackwell-optimised attention |
 | N2 | PR #35576: MLA kv_b_proj.weight.dtype crash fix | Prevents AttributeError for NVFP4 MLA models |
 | N3 | PR #34577: NVFP4 scale BF16 underflow fix | Prevents zero scales / corrupted Marlin output |
+| O | avarok v23: SM121 native FP8 CUTLASS kernels (scaled_mm_c3x_sm121, sm121_fp8, blockwise_sm121_fp8) | FP8 attention uses Blackwell SM100 kernels instead of PyTorch fallback |
+| O | avarok v23: GB10 native MoE kernel v109 (grouped_mm_gb10_native_v109) | Sm120+Pingpong+128³ tiles for GeForce MoE; tcgen05 5th-gen tensor cores enabled |
+| O | avarok v23: NVFP4 v6 full compilation (all nvfp4_*.cu for sm_121) | Eliminates Python FP4 quant fallback, fixes CUDA graph capture |
+| O | avarok v23: scaled_mm_entry.cu version_num >= 120 && < 130 | Prevents SM130+ dispatch collision |
 
 ---
 
