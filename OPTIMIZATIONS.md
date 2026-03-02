@@ -4,7 +4,25 @@ All patches needed to run vLLM on NVIDIA DGX GB10 (SM 12.1, aarch64, CUDA 13.0).
 
 ---
 
-## Build
+## Build & Launch
+
+Use `~/sandbox/vllm.sh` for all build and launch operations:
+
+```bash
+# One-time build (creates .venv-gb10, compiles vllm)
+~/sandbox/vllm.sh build
+
+# Launch server (sets all runtime env vars automatically)
+~/sandbox/vllm.sh launch \
+  --model ~/models/MiniMax-M2.5-REAP-139B-A10B-NVFP4/ \
+  --quantization modelopt_fp4 --kv-cache-dtype fp8 \
+  --max-model-len 4096 --enforce-eager
+
+# Drop into venv shell for debugging
+~/sandbox/vllm.sh shell
+```
+
+### Manual build (if needed)
 
 ```bash
 cd ~/sandbox/vllm
