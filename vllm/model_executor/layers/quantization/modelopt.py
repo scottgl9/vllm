@@ -167,6 +167,14 @@ class ModelOptQuantConfigBase(QuantizationConfig):
             if fnmatch(prefix, wildcard_pattern):
                 return True
 
+        # All MTP weights in NVFP4 checkpoints are BF16 (unquantized).
+        # The exclude list may only have 'mtp.layers.0*' which misses 'mtp.fc'.
+        # If any exclude pattern targets mtp.*, exclude all mtp.* layers.
+        if prefix.startswith("mtp."):
+            for wildcard_pattern in self.exclude_modules:
+                if wildcard_pattern.startswith("mtp."):
+                    return True
+
         return False
 
     def get_quant_method(
