@@ -23,14 +23,19 @@
 # limitations under the License.
 """Inference-only MiniMaxM2 model."""
 
+import os
 from collections.abc import Iterable
 from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import Parameter
 from transformers import PretrainedConfig
 
 from vllm.compilation.decorators import support_torch_compile
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
@@ -68,6 +73,126 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+# --------------------------------------------------------------------------- #
+# Post-quantization: convert BF16 lm_head to NVFP4 at load time
+# --------------------------------------------------------------------------- #
+
+_FP4_MAX = 6.0
+
+
+class _Fp4EmbeddingMethodAdapter:
+    """Minimal quant_method adapter that dispatches lm_head through FP4 GEMM.
+
+    Installed by ``_post_quantize_lm_head_to_nvfp4`` after packing the
+    BF16 weight into NVFP4 format.  ``LogitsProcessor`` calls
+    ``lm_head.quant_method.apply(lm_head, hidden_states)`` — this class
+    bridges that call to ``apply_nvfp4_linear``.
+    """
+
+    def __init__(self, backend):
+        self.backend = backend
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+            apply_nvfp4_linear,
+        )
+
+        return apply_nvfp4_linear(
+            backend=self.backend,
+            layer=layer,
+            x=x,
+            bias=bias,
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        pass  # weights are already prepared
+
+    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor):
+        raise RuntimeError("LMHead should not be used as an embedding layer.")
+
+
+def _post_quantize_lm_head_to_nvfp4(lm_head: nn.Module, layer_name: str):
+    """Post-quantize a BF16 lm_head to NVFP4 in-place.
+
+    This converts the dense BF16 weight into packed FP4 uint8 format with
+    block scales, matching the layout used by ``ModelOptNvFp4LinearMethod``.
+    """
+    from vllm._custom_ops import scaled_fp4_quant
+    from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+        convert_to_nvfp4_linear_kernel_format,
+        select_nvfp4_linear_backend,
+    )
+
+    weight = lm_head.weight.data  # [vocab_size, hidden_dim]
+    if weight.dtype not in (torch.bfloat16, torch.float16):
+        logger.warning(
+            "lm_head weight is %s (not BF16/FP16), skipping post-quantization",
+            weight.dtype,
+        )
+        return
+
+    device = weight.device
+    output_size, input_size = weight.shape
+
+    # Compute global scale: maps max(|weight|) → FP4_MAX
+    weight_global_scale = torch.tensor(
+        _FP4_MAX / weight.abs().max().clamp(min=1e-12).item(),
+        dtype=torch.float32,
+        device=device,
+    )
+    # Input global scale: 1.0 (we don't have calibration data)
+    input_global_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    input_global_scale_inv = torch.tensor(
+        1.0, dtype=torch.float32, device=device
+    )
+
+    # Pack BF16 → FP4 uint8 + block scales
+    weight_fp4, weight_scale = scaled_fp4_quant(
+        weight, weight_global_scale, is_sf_swizzled_layout=False
+    )
+
+    # Install packed params on the layer (matching ModelOptNvFp4LinearMethod)
+    del lm_head.weight
+    lm_head.weight = Parameter(weight_fp4, requires_grad=False)
+    lm_head.weight_scale = Parameter(
+        weight_scale.to(torch.float8_e4m3fn), requires_grad=False
+    )
+    lm_head.weight_global_scale = Parameter(
+        weight_global_scale, requires_grad=False
+    )
+    lm_head.input_global_scale = Parameter(
+        input_global_scale, requires_grad=False
+    )
+    lm_head.input_global_scale_inv = Parameter(
+        input_global_scale_inv, requires_grad=False
+    )
+    lm_head.alpha = Parameter(
+        input_global_scale * weight_global_scale, requires_grad=False
+    )
+    lm_head.output_size_per_partition = output_size
+    lm_head.input_size_per_partition = input_size
+
+    # Select backend and convert to kernel format
+    backend = select_nvfp4_linear_backend()
+    convert_to_nvfp4_linear_kernel_format(backend, lm_head)
+
+    # Replace quant_method with our FP4 adapter
+    lm_head.quant_method = _Fp4EmbeddingMethodAdapter(backend)
+
+    logger.info(
+        "Post-quantized %s to NVFP4: [%d, %d] BF16 (%.1f MB) → FP4 (%.1f MB)",
+        layer_name,
+        output_size,
+        input_size,
+        output_size * input_size * 2 / 1e6,
+        weight_fp4.numel() / 1e6,
+    )
 
 
 class MiniMaxM2MoE(nn.Module):
@@ -541,7 +666,18 @@ class MiniMaxM2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+
+        # Post-quantize lm_head if requested via env var
+        if os.environ.get("VLLM_QUANTIZE_LM_HEAD", "").lower() == "nvfp4":
+            if (
+                hasattr(self, "lm_head")
+                and hasattr(self.lm_head, "weight")
+                and self.lm_head.weight.dtype in (torch.bfloat16, torch.float16)
+            ):
+                _post_quantize_lm_head_to_nvfp4(self.lm_head, "lm_head")
+
+        return loaded
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
