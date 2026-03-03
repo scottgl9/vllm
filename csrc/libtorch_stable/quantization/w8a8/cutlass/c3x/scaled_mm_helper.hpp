@@ -52,6 +52,12 @@ void dispatch_scaled_mm(torch::stable::Tensor& c,
     }
 
     STD_TORCH_CHECK(!bias, "Bias not yet supported blockwise scaled_mm");
-    blockwise_func(c, a, b, a_scales, b_scales);
+    if constexpr (!std::is_same_v<BlockwiseFunc, std::nullptr_t>) {
+      blockwise_func(c, a, b, a_scales, b_scales);
+    } else {
+      int32_t version_num = get_sm_version_num();
+      STD_TORCH_CHECK(false, "Blockwise FP8 scaled_mm not supported on SM",
+                      version_num, ".");
+    }
   }
 }
