@@ -898,12 +898,17 @@ if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
-    ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+    # Mark FA2/FA3 as optional so the build doesn't fail if flash-attention
+    # doesn't compile on CUDA 13.0 (GB10). vllm_flash_attn/__init__.py has
+    # been patched to degrade gracefully and route to FlashInfer instead.
+    ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C",
+                                      optional=True))
     if envs.VLLM_USE_PRECOMPILED or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
     ):
         # FA3 requires CUDA 12.3 or later
-        ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
+        ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C",
+                                          optional=True))
     # FA4 CuteDSL - Python-only component for FA4's cute DSL support
     # Optional since this doesn't produce a .so file, just copies Python files
     ext_modules.append(
