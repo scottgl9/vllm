@@ -19,12 +19,16 @@ void cutlass_scaled_mm_sm121(torch::Tensor& c, torch::Tensor const& a,
                              torch::Tensor const& a_scales,
                              torch::Tensor const& b_scales,
                              std::optional<torch::Tensor> const& bias) {
-  // GB10 (SM_121) is Blackwell family - use SM100 kernels which are compatible
-  // SM100 has 1x1x1 cluster shape configs that work on GB10's hardware constraints
+  // GB10 (SM_121) uses SM121-specific kernels compiled for sm_121f arch.
+  // These use SM100-compatible tile configs (128x256x128, 1x1x1 cluster) but
+  // are compiled with ENABLE_TCGEN05_HARDWARE=1 for optimal tcgen05 tensor core
+  // instructions on GB10 hardware.
+  // Blockwise FP8 is not currently compiled for SM121 (disabled in cmake due to
+  // CUTLASS __CUTLASS_UNUSED macro issue under CUDA 13.0), so nullptr is used.
   dispatch_scaled_mm(c, a, b, a_scales, b_scales, bias,
-                     vllm::cutlass_scaled_mm_sm100_fp8,
+                     vllm::cutlass_scaled_mm_sm121_fp8,
                      nullptr,  // int8 not supported on SM121
-                     vllm::cutlass_scaled_mm_blockwise_sm100_fp8);
+                     nullptr); // blockwise SM121 not yet compiled
 }
 
 #endif
