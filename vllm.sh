@@ -295,7 +295,6 @@ cmd_qwen3_coder_next_fp8() {
         --gpu-memory-utilization 0.86 \
         --max-num-seqs 4 \
         --max-model-len "${ctx}" \
-        --stream-interval 5 \
         "${SERVER_ARGS[@]}" \
         "${QWEN3_ARGS[@]}" \
         "${QWEN3_CODER_ARGS[@]}" \
