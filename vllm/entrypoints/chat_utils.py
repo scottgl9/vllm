@@ -1510,12 +1510,21 @@ def _postprocess_messages(messages: list[ConversationMessage]) -> None:
                 continue
 
             for item in tool_calls:
-                # if arguments is None or empty string, set to {}
-                if content := item["function"].get("arguments"):
-                    if not isinstance(content, (dict, list)):
-                        item["function"]["arguments"] = json.loads(content)
+                # arguments must be a dict for Jinja2 |items in chat templates
+                func = item.get("function")
+                if func is None:
+                    continue
+                content = func.get("arguments")
+                if isinstance(content, dict):
+                    pass  # already correct
+                elif not content and content != 0:
+                    func["arguments"] = {}
                 else:
-                    item["function"]["arguments"] = {}
+                    try:
+                        parsed = json.loads(content) if isinstance(content, str) else content
+                        func["arguments"] = parsed if isinstance(parsed, dict) else {}
+                    except (json.JSONDecodeError, ValueError):
+                        func["arguments"] = {}
 
 
 def parse_chat_messages(

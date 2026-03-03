@@ -152,7 +152,7 @@ set -euo pipefail
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VLLM_DIR="${SCRIPT_DIR}/vllm"
+VLLM_DIR="$(pwd)"
 VENV_DIR="${VLLM_DIR}/.venv-gb10"
 PYTHON="python3.12"
 
@@ -387,11 +387,12 @@ cmd_qwen35_nvfp4() {
 
     cmd_launch \
         --model "${model}" \
+        --served-model-name qwen3-coder-next \
         --quantization compressed-tensors \
         --kv-cache-dtype fp8 \
-        --gpu-memory-utilization 0.84 \
+        --gpu-memory-utilization 0.88 \
         --max-model-len 65536 \
-        --max-num-seqs 8 \
+        --max-num-seqs 3 \
         --attention-backend flashinfer \
         --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}' \
         --no-enable-chunked-prefill \
@@ -424,7 +425,7 @@ cmd_qwen3_coder_next_nvfp4() {
         --max-num-batched-tokens 8192 \
         --enable-auto-tool-choice \
         --tool-call-parser qwen3_coder \
-        --max-model-len 65536 \
+        --max-model-len 131072 \
         "$@"
 }
 
