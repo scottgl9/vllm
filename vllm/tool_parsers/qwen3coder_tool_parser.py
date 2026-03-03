@@ -108,6 +108,9 @@ class Qwen3CoderToolParser(ToolParser):
         # Store accumulated parameters for type conversion
         self.accumulated_params = {}
         self.streaming_request = None
+        # Reset per-request tracking lists (prevent stale state bleeding into next request)
+        self.streamed_args_for_tool = []
+        self.prev_tool_call_arr = []
 
     def _get_arguments_config(
         self, func_name: str, tools: list[ChatCompletionToolsParam] | None
