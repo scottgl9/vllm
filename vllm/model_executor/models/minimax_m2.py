@@ -177,6 +177,7 @@ def _post_quantize_lm_head_to_nvfp4(lm_head: nn.Module, layer_name: str):
     )
     lm_head.output_size_per_partition = output_size
     lm_head.input_size_per_partition = input_size
+    lm_head.params_dtype = weight.dtype  # required by prepare_fp4_layer_for_marlin
 
     # Select backend and convert to kernel format
     backend = select_nvfp4_linear_backend()
