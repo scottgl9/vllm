@@ -238,7 +238,13 @@ cmd_qwen35_nvfp4() {
         [[ -n "${model}" ]] || die "Qwen3.5-NVFP4 not found at ${base}. Set QWEN35_MODEL=/path/to/snapshot"
     fi
 
-    info "Preset: Qwen3.5-122B-A10B-NVFP4 (compressed-tensors, speculative qwen3_next_mtp)"
+    local spec_args=()
+    if [[ "${DISABLE_MTP:-}" != "1" ]]; then
+        spec_args=(--speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}')
+        info "Preset: Qwen3.5-122B-A10B-NVFP4 (compressed-tensors, speculative qwen3_next_mtp)"
+    else
+        info "Preset: Qwen3.5-122B-A10B-NVFP4 (compressed-tensors, MTP DISABLED)"
+    fi
     info "  Model : ${model}"
     info "  MaxLen: ${MAX_MODEL_LEN}"
 
@@ -250,7 +256,7 @@ cmd_qwen35_nvfp4() {
         --max-model-len "${MAX_MODEL_LEN}" \
         --max-num-seqs 3 \
         --attention-backend flashinfer \
-        --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}' \
+        "${spec_args[@]}" \
         --no-enable-chunked-prefill \
         --reasoning-parser qwen3 \
         --language-model-only \
