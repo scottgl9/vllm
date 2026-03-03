@@ -59,6 +59,14 @@ void cutlass_scaled_mm_sm120(torch::Tensor& c, torch::Tensor const& a,
                              std::optional<torch::Tensor> const& bias);
 #endif
 
+#if defined ENABLE_SCALED_MM_SM121 && ENABLE_SCALED_MM_SM121
+void cutlass_scaled_mm_sm121(torch::Tensor& c, torch::Tensor const& a,
+                             torch::Tensor const& b,
+                             torch::Tensor const& a_scales,
+                             torch::Tensor const& b_scales,
+                             std::optional<torch::Tensor> const& bias);
+#endif
+
 #if defined ENABLE_SCALED_MM_SM100 && ENABLE_SCALED_MM_SM100
 void cutlass_scaled_mm_sm100(torch::Tensor& c, torch::Tensor const& a,
                              torch::Tensor const& b,
@@ -192,6 +200,15 @@ void cutlass_scaled_mm(torch::Tensor& c, torch::Tensor const& a,
 
   at::cuda::OptionalCUDAGuard const device_guard(device_of(a));
   int32_t version_num = get_sm_version_num();
+
+#if defined ENABLE_SCALED_MM_SM121 && ENABLE_SCALED_MM_SM121
+  if (version_num == 121) {
+    // GB10 (DGX Spark): use SM121-specific kernels compiled for sm_121f with
+    // ENABLE_TCGEN05_HARDWARE=1, not the generic SM120 path.
+    cutlass_scaled_mm_sm121(c, a, b, a_scales, b_scales, bias);
+    return;
+  }
+#endif
 
 #if defined ENABLE_SCALED_MM_SM120 && ENABLE_SCALED_MM_SM120
   if (version_num >= 120 && version_num < 130) {

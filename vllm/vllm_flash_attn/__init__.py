@@ -11,9 +11,11 @@ from vllm.vllm_flash_attn.flash_attn_interface import (
 )
 
 if not (FA2_AVAILABLE or FA3_AVAILABLE):
-    raise ImportError(
-        "vllm.vllm_flash_attn requires the CUDA flash attention extensions "
-        "(_vllm_fa2_C or _vllm_fa3_C). On ROCm, use upstream flash_attn."
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "vllm.vllm_flash_attn: neither _vllm_fa2_C nor _vllm_fa3_C is "
+        "available — FlashInfer will be used as attention backend. "
+        "Rebuild vllm with CUDA torch active to enable FA extensions."
     )
 
 __all__ = [
