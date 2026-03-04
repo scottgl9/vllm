@@ -70,7 +70,10 @@ export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export TORCH_CUDA_ARCH_LIST="12.1a"
 # Do NOT set -arch here: cmake handles arch via TORCH_CUDA_ARCH_LIST.
 # Adding -arch=sm_121a conflicts with cmake's own sm_121 gencode flags.
-export NVCC_PREPEND_FLAGS="-DENABLE_TCGEN05_HARDWARE=1"
+# ENABLE_NVFP4_SM120=1: required for scaled_fp4_quant on SM120/SM121.
+# cmake sets this automatically via FP4_ARCHS when TORCH_CUDA_ARCH_LIST="12.1a",
+# but we also set it here via NVCC_PREPEND_FLAGS as a safety net.
+export NVCC_PREPEND_FLAGS="-DENABLE_TCGEN05_HARDWARE=1 -DENABLE_NVFP4_SM120=1"
 export TRITON_PTXAS_PATH="${CUDA_HOME}/bin/ptxas"
 # Set MAX_JOBS before calling this script to override (default: 8 for GB10).
 export MAX_JOBS="${MAX_JOBS:-8}"
@@ -103,10 +106,10 @@ setup_runtime_env() {
     # SM121 now recognized as SM120 family (PR #35568) — CUTLASS FP8 works natively.
     # No longer need VLLM_TEST_FORCE_FP8_MARLIN; let vLLM auto-select best FP8 backend.
     # Set VLLM_TEST_FORCE_FP8_MARLIN=1 to force Marlin FP8 if CUTLASS has issues.
-    # Disable FlashInfer MoE FP4 by default (Marlin MoE is stable on GB10).
-    # Set VLLM_USE_FLASHINFER_MOE_FP4=1 to try FlashInfer's FP4 MoE (TRTLLM JIT
-    # now compiles for SM121 via gb10_compat patch).
-    export VLLM_USE_FLASHINFER_MOE_FP4="${VLLM_USE_FLASHINFER_MOE_FP4:-0}"
+    # FlashInfer TRTLLM MoE FP4 is NOT supported on SM121 (GB10).
+    # The TRTLLM kernel has a hardcoded C++ ICHECK_EQ(major, 10) that rejects SM12x
+    # at runtime even after JIT compilation succeeds. Use Marlin MoE instead.
+    export VLLM_USE_FLASHINFER_MOE_FP4=0
     # Disable DeepGEMM (not supported on SM121)
     export VLLM_USE_DEEP_GEMM=0
     # spawn avoids fork-related CUDA issues with multiprocessing
@@ -204,6 +207,18 @@ cmd_build() {
     echo "  platform cap       : ${PLATFORM}"
     echo ""
 
+    # Verify NVFP4 SM120/SM121 kernels were compiled in.
+    # If ENABLE_NVFP4_SM120=1 was not active during compilation, scaled_fp4_quant
+    # falls through to TORCH_CHECK_NOT_IMPLEMENTED and produces "!!!!" output on GB10.
+    local so_path="${VLLM_DIR}/vllm/_C.abi3.so"
+    if strings "${so_path}" 2>/dev/null | grep -q "scaled_fp4_quant_sm1xxa"; then
+        success "NVFP4 SM120/SM121 kernels present in _C.abi3.so"
+    else
+        warn "WARNING: NVFP4 SM120/SM121 kernels NOT found in _C.abi3.so"
+        warn "  ENABLE_NVFP4_SM120=1 was not compiled in — Qwen3.5-NVFP4 will output '!!!!'"
+        warn "  Ensure TORCH_CUDA_ARCH_LIST='12.1a' is set and rebuild."
+    fi
+
     if [[ "${TORCH_CUDA}" == "None" || "${TORCH_CUDA}" == "" ]]; then
         warn "torch.version.cuda is None — CPU-only torch was installed."
         warn "Fix: pip install torch==2.10.0+cu130 --index-url https://download.pytorch.org/whl/cu130"
@@ -218,18 +233,29 @@ cmd_launch() {
     # Kill any existing vLLM server and wait for GPU memory to drain.
     # Launching while the previous server still holds VRAM risks GPU OOM
     # which can cascade into a full system hang on GB10 (unified memory).
-    local existing
+    #
+    # We kill both the API server (matches "vllm.entrypoints.openai") and any
+    # orphaned EngineCore subprocesses (which rename themselves to "VLLM::EngineCore"
+    # and are invisible to pgrep -f "vllm.entrypoints.openai").
+    local existing engine_cores
     existing=$(pgrep -f "vllm.entrypoints.openai" 2>/dev/null || true)
-    if [[ -n "${existing}" ]]; then
-        info "Stopping existing vLLM server (PIDs: ${existing})..."
-        kill ${existing} 2>/dev/null || true
+    engine_cores=$(pgrep -x "VLLM::EngineCore" 2>/dev/null || true)
+    local all_pids="${existing} ${engine_cores}"
+    all_pids="${all_pids## }"  # trim leading space
+    all_pids="${all_pids%% }"  # trim trailing space
+    if [[ -n "${all_pids// /}" ]]; then
+        info "Stopping existing vLLM server (PIDs: ${all_pids})..."
+        # shellcheck disable=SC2086
+        kill ${all_pids} 2>/dev/null || true
         local waited=0
-        while pgrep -f "vllm.entrypoints.openai" > /dev/null 2>&1; do
+        while pgrep -f "vllm.entrypoints.openai" > /dev/null 2>&1 \
+              || pgrep -x "VLLM::EngineCore" > /dev/null 2>&1; do
             sleep 1
             (( waited++ )) || true
             if (( waited >= 30 )); then
                 info "  Sending SIGKILL after ${waited}s..."
                 pkill -9 -f "vllm.entrypoints.openai" 2>/dev/null || true
+                pkill -9 -x "VLLM::EngineCore" 2>/dev/null || true
                 break
             fi
         done
