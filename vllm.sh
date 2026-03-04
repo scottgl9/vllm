@@ -100,10 +100,13 @@ setup_runtime_env() {
     export VLLM_NVFP4_GEMM_BACKEND="${VLLM_NVFP4_GEMM_BACKEND:-marlin}"
     # Marlin atomic-add reduction (improves throughput on GB10)
     export VLLM_MARLIN_USE_ATOMIC_ADD=1
-    # Force Marlin for FP8 GEMMs (CUTLASS FP8 path not SM121-ready)
-    export VLLM_TEST_FORCE_FP8_MARLIN=1
-    # Disable FlashInfer MoE FP4 (Marlin is used instead on GB10)
-    export VLLM_USE_FLASHINFER_MOE_FP4=0
+    # SM121 now recognized as SM120 family (PR #35568) — CUTLASS FP8 works natively.
+    # No longer need VLLM_TEST_FORCE_FP8_MARLIN; let vLLM auto-select best FP8 backend.
+    # Set VLLM_TEST_FORCE_FP8_MARLIN=1 to force Marlin FP8 if CUTLASS has issues.
+    # Disable FlashInfer MoE FP4 by default (Marlin MoE is stable on GB10).
+    # Set VLLM_USE_FLASHINFER_MOE_FP4=1 to try FlashInfer's FP4 MoE (TRTLLM JIT
+    # now compiles for SM121 via gb10_compat patch).
+    export VLLM_USE_FLASHINFER_MOE_FP4="${VLLM_USE_FLASHINFER_MOE_FP4:-0}"
     # Disable DeepGEMM (not supported on SM121)
     export VLLM_USE_DEEP_GEMM=0
     # spawn avoids fork-related CUDA issues with multiprocessing
@@ -211,6 +214,29 @@ cmd_build() {
 
 cmd_launch() {
     [[ -d "${VENV_DIR}" ]] || die "Venv not found at ${VENV_DIR}. Run: ./vllm.sh build"
+
+    # Kill any existing vLLM server and wait for GPU memory to drain.
+    # Launching while the previous server still holds VRAM risks GPU OOM
+    # which can cascade into a full system hang on GB10 (unified memory).
+    local existing
+    existing=$(pgrep -f "vllm.entrypoints.openai" 2>/dev/null || true)
+    if [[ -n "${existing}" ]]; then
+        info "Stopping existing vLLM server (PIDs: ${existing})..."
+        kill ${existing} 2>/dev/null || true
+        local waited=0
+        while pgrep -f "vllm.entrypoints.openai" > /dev/null 2>&1; do
+            sleep 1
+            (( waited++ )) || true
+            if (( waited >= 30 )); then
+                info "  Sending SIGKILL after ${waited}s..."
+                pkill -9 -f "vllm.entrypoints.openai" 2>/dev/null || true
+                break
+            fi
+        done
+        # Give the NVIDIA driver time to reclaim GPU memory
+        info "  Waiting 5s for GPU memory to be released..."
+        sleep 5
+    fi
 
     # shellcheck disable=SC1091
     source "${VENV_DIR}/bin/activate"
