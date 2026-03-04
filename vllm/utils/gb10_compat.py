@@ -187,6 +187,69 @@ def _copy_fp4_header(data_dir: str) -> None:
         logger.debug("GB10 compat: copied %s -> %s", src, dst)
 
 
+def _patch_trtllm_fused_moe_jit() -> None:
+    """Add SM12x to TRTLLM fused MoE JIT supported_major_versions."""
+    candidates: list[str] = []
+    try:
+        candidates += [
+            os.path.join(sp, "flashinfer", "jit", "fused_moe.py")
+            for sp in site.getsitepackages()
+        ]
+        candidates.append(
+            os.path.join(
+                site.getusersitepackages(), "flashinfer", "jit", "fused_moe.py"
+            )
+        )
+    except Exception:
+        pass
+
+    venv = os.environ.get("VIRTUAL_ENV")
+    if venv:
+        for pyver in ("python3.12", "python3.11", "python3.13", "python3.10"):
+            candidates.append(
+                os.path.join(
+                    venv, "lib", pyver, "site-packages",
+                    "flashinfer", "jit", "fused_moe.py"
+                )
+            )
+
+    target = None
+    for c in candidates:
+        if os.path.isfile(c):
+            target = c
+            break
+    if target is None:
+        return
+
+    with open(target) as f:
+        content = f.read()
+
+    if "SM121 patched" in content:
+        return  # already patched
+
+    # The TRTLLM module hardcodes supported_major_versions=[10].
+    # SM121 has major=12, so add 12 to the list.
+    # We target the specific function gen_trtllm_gen_fused_moe_sm100_module.
+    old = (
+        "    # currently only support Blackwell\n"
+        "    nvcc_flags = current_compilation_context.get_nvcc_flags_list(\n"
+        "        supported_major_versions=[10]\n"
+        "    )"
+    )
+    new = (
+        "    # currently only support Blackwell\n"
+        "    # SM121 patched: add major=12 for DGX Spark GB10\n"
+        "    nvcc_flags = current_compilation_context.get_nvcc_flags_list(\n"
+        "        supported_major_versions=[10, 12]\n"
+        "    )"
+    )
+    if old in content:
+        content = content.replace(old, new)
+        with open(target, "w") as f:
+            f.write(content)
+        logger.debug("GB10 compat: patched TRTLLM JIT in %s", target)
+
+
 def _clear_moe_jit_cache() -> None:
     """Clear FlashInfer MoE JIT cache to force recompilation."""
     cache_dir = os.path.expanduser("~/.cache/flashinfer")
@@ -227,5 +290,6 @@ def ensure_flashinfer_sm121_compat() -> None:
     _patch_quantization_utils(data_dir)
     _patch_arch_condition(data_dir)
     _copy_fp4_header(data_dir)
+    _patch_trtllm_fused_moe_jit()
     _clear_moe_jit_cache()
     logger.info("GB10 compat: FlashInfer patches complete")

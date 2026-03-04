@@ -271,11 +271,46 @@ def select_nvfp4_moe_backend(
             requested_backend, config, weight_key, activation_key, activation_format
         )
 
-    if envs.VLLM_TEST_FORCE_FP8_MARLIN:
-        backend = NvFp4MoeBackend.MARLIN
-        return _return_or_raise(
-            backend, config, weight_key, activation_key, activation_format
-        )
+    if envs.is_set("VLLM_USE_FLASHINFER_MOE_FP4"):
+        if not envs.VLLM_USE_FLASHINFER_MOE_FP4:
+            # If the user rejects FlashInfer remove those backends.
+            for b in FLASHINFER_NVFP4_MOE_BACKENDS:
+                AVAILABLE_BACKENDS.remove(b)
+
+        elif envs.is_set("VLLM_FLASHINFER_MOE_BACKEND"):
+            # If user is explicit about backend, validate it.
+            backend = fi_2_vllm_backend_map[get_flashinfer_moe_backend()]
+            return _return_or_raise(
+                backend, config, weight_key, activation_key, activation_format
+            )
+        else:
+            # If the user is not explicit about the backend, try each.
+            for backend in FLASHINFER_NVFP4_MOE_BACKENDS:
+                for k_cls in backend_to_kernel_cls(backend):
+                    supported, reason = k_cls.is_supported_config(
+                        k_cls,
+                        config,
+                        weight_key,
+                        activation_key,
+                        activation_format,
+                    )
+                    if supported:
+                        logger.info_once(_make_log_backend(backend), scope="local")
+                        return backend, k_cls
+                    else:
+                        logger.debug_once(
+                            _make_log_unsupported(backend, reason), scope="local"
+                        )
+
+            raise NotImplementedError(
+                "Found VLLM_USE_FLASHINFER_MOE_FP4=1, but no "
+                "FlashInfer NVFP4 MoE backend supports the configuration."
+            )
+
+    # NOTE(gb10): VLLM_TEST_FORCE_FP8_MARLIN is NOT applied here because
+    # it is intended for FP8 linear layers only (CUTLASS FP8 is not
+    # SM121-ready). CUTLASS FP4 MoE IS supported on SM121 (Blackwell
+    # SM120 family), so we allow the auto-selection to choose it.
 
     # Select kernels in order of backend.
     for backend in AVAILABLE_BACKENDS:
