@@ -417,9 +417,6 @@ class Qwen3_5Model(Qwen3NextModel):
             if name.startswith("mtp."):
                 continue
 
-            if "mlp.gate.weight" in name or "mlp.gate.bias" in name:
-                continue
-
             # Remapping the name of FP8 kv-scale.
             if name.endswith("scale"):
                 name = maybe_remap_kv_scale_name(name, params_dict)
@@ -432,6 +429,11 @@ class Qwen3_5Model(Qwen3NextModel):
                     expert_params_mapping = fused_expert_params_mapping
 
                 if weight_name not in name:
+                    continue
+
+                # Prevent false match: "gate_proj" substring matches "mlp.gate.weight".
+                # MoE router gate is a plain nn.Linear — load it via the default path below.
+                if "mlp.gate.weight" in name or "mlp.gate.bias" in name:
                     continue
 
                 if "mlp.experts" in name:
