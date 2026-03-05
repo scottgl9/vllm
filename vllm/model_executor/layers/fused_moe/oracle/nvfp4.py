@@ -307,10 +307,11 @@ def select_nvfp4_moe_backend(
                 "FlashInfer NVFP4 MoE backend supports the configuration."
             )
 
-    # NOTE(gb10): VLLM_TEST_FORCE_FP8_MARLIN is NOT applied here because
-    # it is intended for FP8 linear layers only (CUTLASS FP8 is not
-    # SM121-ready). CUTLASS FP4 MoE IS supported on SM121 (Blackwell
-    # SM120 family), so we allow the auto-selection to choose it.
+    if envs.VLLM_TEST_FORCE_FP8_MARLIN:
+        backend = NvFp4MoeBackend.MARLIN
+        return _return_or_raise(
+            backend, config, weight_key, activation_key, activation_format
+        )
 
     # Select kernels in order of backend.
     for backend in AVAILABLE_BACKENDS:
@@ -457,6 +458,28 @@ def convert_to_nvfp4_moe_kernel_format(
             w2_scale_2=w2_scale_2,
             is_act_and_mul=is_act_and_mul,
         )
+        # GB10 (SM121) workaround: the Marlin MoE CUDA kernel produces NaN
+        # when reading weight tensors from certain CUDA unified memory
+        # addresses. Cloning forces fresh allocations at accessible addresses.
+        if (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_capability() == (12, 1)
+        ):
+            logger.warning("GB10 workaround: cloning MoE weight tensors")
+            w13 = w13.clone()
+            w13_scale = w13_scale.clone()
+            w13_scale_2 = (
+                w13_scale_2.clone()
+                if isinstance(w13_scale_2, torch.Tensor)
+                else w13_scale_2
+            )
+            w2 = w2.clone()
+            w2_scale = w2_scale.clone()
+            w2_scale_2 = (
+                w2_scale_2.clone()
+                if isinstance(w2_scale_2, torch.Tensor)
+                else w2_scale_2
+            )
     elif nvfp4_backend == NvFp4MoeBackend.EMULATION:
         # Move the E2M1 lookup table to the device now, because
         # `.to(device)` is not allowed during CUDA graph capture.
