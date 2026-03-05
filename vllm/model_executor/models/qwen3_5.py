@@ -431,9 +431,9 @@ class Qwen3_5Model(Qwen3NextModel):
                 if weight_name not in name:
                     continue
 
-                # Prevent false match: "gate_proj" substring matches "mlp.gate.weight".
-                # MoE router gate is a plain nn.Linear — load it via the default path below.
-                if "mlp.gate.weight" in name or "mlp.gate.bias" in name:
+                # MoE router gate is a plain nn.Linear; skip the stacked parameter
+                # path and load it via the default path below.
+                if "mlp.gate." in name:
                     continue
 
                 if "mlp.experts" in name:
