@@ -1498,6 +1498,17 @@ class SpecDecodeBaseProposer:
         # Initialize optimized draft sampler
         self._init_draft_sample_opt()
 
+        # Post-quantize MTP MoE experts to FP8 (before CUDA graph capture)
+        if os.environ.get("VLLM_MTP_MOE_FP8", "0") == "1":
+            from vllm.v1.spec_decode.draft_sample_opt import quantize_mtp_moe_fp8
+
+            n = quantize_mtp_moe_fp8(self.model)
+            logger.info(
+                "VLLM_MTP_MOE_FP8=1: quantized %d MoE layer(s) to FP8 "
+                "(must happen before CUDA graph capture)",
+                n,
+            )
+
     def _init_draft_sample_opt(self) -> None:
         """Initialize optimized draft token sampling based on env var."""
         mode = self._draft_sample_opt_mode
