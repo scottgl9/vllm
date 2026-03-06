@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import os
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, cast
 
@@ -132,6 +133,12 @@ class SpecDecodeBaseProposer:
             self.speculative_config.use_local_argmax_reduction
         )
         self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
+        # Optimized draft sampling: set via VLLM_DRAFT_SAMPLE_OPT env var
+        # Options: "none", "compiled", "fp8"
+        self._draft_sample_opt_mode = os.environ.get(
+            "VLLM_DRAFT_SAMPLE_OPT", "none"
+        ).lower()
+        self._draft_sample_opt = None  # Initialized in load_model
 
         self.use_heterogeneous_vocab: bool = (
             self.speculative_config.use_heterogeneous_vocab
@@ -443,6 +450,9 @@ class SpecDecodeBaseProposer:
             logits = self.vocab_mapping.constrain_draft_logits(logits)
             draft_token_ids = logits.argmax(dim=-1)
             return self.vocab_mapping.map_draft_to_target_ids(draft_token_ids)
+        # Use optimized sampler if available (FP8, fused, or compiled)
+        if self._draft_sample_opt is not None:
+            return self._draft_sample_opt(hidden_states)
         return self.model.compute_logits(hidden_states).argmax(dim=-1)
 
     def _sample_from_logits(
@@ -1628,6 +1638,58 @@ class SpecDecodeBaseProposer:
             logger.info(
                 "Using local argmax reduction for draft token generation "
                 "(communication: O(2*tp_size) vs O(vocab_size))."
+            )
+
+        # Initialize optimized draft sampler
+        self._init_draft_sample_opt()
+
+    def _init_draft_sample_opt(self) -> None:
+        """Initialize optimized draft token sampling based on env var."""
+        mode = self._draft_sample_opt_mode
+        if mode == "none":
+            return
+
+        # Need lm_head and logits_processor from the model
+        if not hasattr(self.model, "lm_head") or not hasattr(
+            self.model, "logits_processor"
+        ):
+            logger.warning(
+                "VLLM_DRAFT_SAMPLE_OPT=%s but model has no lm_head/"
+                "logits_processor. Falling back to default.",
+                mode,
+            )
+            return
+
+        lm_head = self.model.lm_head
+        logits_processor = self.model.logits_processor
+        org_vocab_size = logits_processor.org_vocab_size
+
+        if mode == "compiled":
+            from vllm.v1.spec_decode.draft_sample_opt import (
+                compiled_greedy_sample,
+            )
+
+            self._draft_sample_opt = lambda hs: compiled_greedy_sample(
+                lm_head, logits_processor, hs
+            )
+            logger.info(
+                "Using torch.compile'd draft sampling (VLLM_DRAFT_SAMPLE_OPT=compiled)"
+            )
+
+        elif mode == "fp8":
+            from vllm.v1.spec_decode.draft_sample_opt import FP8LMHeadSampler
+
+            sampler = FP8LMHeadSampler(lm_head, org_vocab_size)
+            self._draft_sample_opt = sampler.sample
+            logger.info(
+                "Using FP8 lm_head draft sampling (VLLM_DRAFT_SAMPLE_OPT=fp8)"
+            )
+
+        else:
+            logger.warning(
+                "Unknown VLLM_DRAFT_SAMPLE_OPT=%s. "
+                "Valid: none, compiled, fp8",
+                mode,
             )
 
     @torch.inference_mode()
