@@ -9,6 +9,9 @@ reducing that cost:
 
 1. compiled_greedy_sample: torch.compile wrapper (3.3x speedup, 100% accuracy)
 2. FP8LMHeadSampler: FP8 weight quantization (9.5x speedup, ~85% accuracy)
+3. quantize_mtp_moe_fp8: post-quantize MTP MoE expert weights to FP8 at load
+   time (before CUDA graph capture). Halves active-expert memory per draft step.
+   Enable with VLLM_MTP_MOE_FP8=1.
 
 Usage: set VLLM_DRAFT_SAMPLE_OPT=compiled|fp8 environment variable.
 """
@@ -135,3 +138,95 @@ class FP8LMHeadSampler:
         # Trim vocab padding and argmax
         logits = logits[..., : self.org_vocab_size]
         return logits.argmax(dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Option 3: FP8 post-quantization of MTP MoE expert weights
+# ---------------------------------------------------------------------------
+
+def quantize_mtp_moe_fp8(mtp_model: torch.nn.Module) -> int:
+    """Post-quantize MTP MoE expert weights from bf16 to FP8 W8A8.
+
+    Must be called BEFORE CUDA graph capture so the graphs capture the FP8
+    kernel path. Replaces quant_method.moe_quant_config and quant_method.kernel
+    on each UnquantizedFusedMoEMethod layer whose weights are still bf16.
+
+    Per-expert per-tensor quantization: one scale per expert per weight matrix.
+    Halves active-expert memory bandwidth per draft step:
+      35B: 50 MB -> 25 MB/step, 122B: 151 MB -> 75 MB/step.
+
+    Returns the number of MoE layers quantized.
+    """
+    from vllm.model_executor.layers.fused_moe.config import (
+        fp8_w8a8_moe_quant_config,
+    )
+    from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+        make_unquantized_moe_kernel,
+    )
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+    from vllm.model_executor.utils import replace_parameter
+
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8_dtype).max  # 448.0
+    count = 0
+
+    for name, layer in mtp_model.named_modules():
+        qm = getattr(layer, "quant_method", None)
+        if not isinstance(qm, UnquantizedFusedMoEMethod):
+            continue
+        if not (hasattr(layer, "w13_weight") and hasattr(layer, "w2_weight")):
+            continue
+        if layer.w13_weight.dtype != torch.bfloat16:
+            continue
+
+        num_experts = layer.w13_weight.shape[0]
+        w13 = layer.w13_weight.data.float()
+        w2 = layer.w2_weight.data.float()
+
+        # Per-expert per-tensor scales
+        w13_scale = (
+            w13.abs().view(num_experts, -1).max(dim=1).values / fp8_max
+        ).clamp(min=1e-12)
+        w2_scale = (
+            w2.abs().view(num_experts, -1).max(dim=1).values / fp8_max
+        ).clamp(min=1e-12)
+
+        w13_fp8 = (w13 / w13_scale.view(-1, 1, 1)).clamp(-fp8_max, fp8_max).to(
+            fp8_dtype
+        )
+        w2_fp8 = (w2 / w2_scale.view(-1, 1, 1)).clamp(-fp8_max, fp8_max).to(
+            fp8_dtype
+        )
+
+        replace_parameter(
+            layer, "w13_weight", torch.nn.Parameter(w13_fp8, requires_grad=False)
+        )
+        replace_parameter(
+            layer, "w2_weight", torch.nn.Parameter(w2_fp8, requires_grad=False)
+        )
+
+        fp8_qconfig = fp8_w8a8_moe_quant_config(
+            w1_scale=w13_scale, w2_scale=w2_scale
+        )
+        qm.moe_quant_config = fp8_qconfig
+        qm.kernel = make_unquantized_moe_kernel(
+            backend=qm.unquantized_backend,
+            quant_config=fp8_qconfig,
+            moe_config=qm.moe,
+        )
+        count += 1
+
+        orig_mb = (w13.numel() + w2.numel()) * 4 / 1024 / 1024  # float32 ref
+        fp8_mb = (w13_fp8.numel() + w2_fp8.numel()) / 1024 / 1024
+        logger.info(
+            "quantize_mtp_moe_fp8: %s -> FP8, %.0f MB (bf16) -> %.0f MB (fp8), "
+            "num_experts=%d",
+            name,
+            orig_mb / 2,  # bf16 is 2 bytes
+            fp8_mb,
+            num_experts,
+        )
+
+    return count
