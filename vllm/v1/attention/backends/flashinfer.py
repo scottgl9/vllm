@@ -1158,12 +1158,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
 
-    # NOTE: build_for_drafting override removed — the base class
-    # implementation (which calls self.build with decode path) is used
-    # instead. The previous override forced the prefill path on SM121
-    # to avoid a crash in BatchDecodeWithPagedKVCacheWrapper, but the
-    # container (v23, vLLM 0.16.0rc2) runs fine without it. Testing
-    # whether native decode works on SM121 with FlashInfer 0.6.4.
+    # NOTE: build_for_drafting override removed (commit 41f74917a).
+    # The base class calls self.build(fast_build=True) which uses the
+    # native FlashInfer decode path. The previous override forced the
+    # prefill path on SM121 to avoid a suspected crash, but the native
+    # decode path works correctly on SM121 with FlashInfer 0.6.4+.
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
         if self.kv_cache_spec.dtype != self.vllm_config.model_config.dtype:
