@@ -806,6 +806,11 @@ def get_model_params(config):
         # Pixtral can contain different LLM architectures,
         # recurse to get their parameters
         return get_model_params(config.get_text_config())
+    elif config.architectures[0] == "MiniMaxM2ForCausalLM":
+        E = config.num_local_experts
+        topk = config.num_experts_per_tok
+        intermediate_size = config.intermediate_size
+        hidden_size = config.hidden_size
     else:
         # Support for llama4
         config = config.get_text_config()

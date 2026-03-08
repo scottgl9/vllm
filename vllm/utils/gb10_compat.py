@@ -187,6 +187,63 @@ def _copy_fp4_header(data_dir: str) -> None:
         logger.debug("GB10 compat: copied %s -> %s", src, dst)
 
 
+def _patch_trtllm_fused_moe_runtime_checks(data_dir: str) -> None:
+    """Relax SM10x-only runtime checks in TRTLLM fused MoE to allow SM12x."""
+    target = os.path.join(
+        data_dir, "csrc", "trtllm_fused_moe_kernel_launcher.cu"
+    )
+    if not os.path.exists(target):
+        return
+
+    with open(target) as f:
+        content = f.read()
+
+    if "SM121 patched" in content:
+        return  # already patched
+
+    patched = False
+
+    # Patch 1: FusedMoeLauncher::init_common() — line ~417
+    old1 = (
+        'TVM_FFI_ICHECK_EQ(major, 10) << "MoE kernel requires 10.x '
+        'architecture. Current device has SM "\n'
+        '                               << major << minor;'
+    )
+    new1 = (
+        'TVM_FFI_ICHECK(major == 10 || major == 12) /* SM121 patched */ '
+        '<< "MoE kernel requires 10.x or 12.x architecture. '
+        'Current device has SM "\n'
+        '                               << major << minor;'
+    )
+    if old1 in content:
+        content = content.replace(old1, new1)
+        patched = True
+
+    # Patch 2: Fp4MoeLauncher::init() — line ~1313
+    old2 = (
+        'TVM_FFI_ICHECK_EQ(std::get<0>(device_props), 10)\n'
+        '        << "This kernel requires 10.x architecture. '
+        'Current device has SM "\n'
+        '        << std::get<0>(device_props) << std::get<1>(device_props);'
+    )
+    new2 = (
+        'TVM_FFI_ICHECK(std::get<0>(device_props) == 10 || '
+        'std::get<0>(device_props) == 12) /* SM121 patched */\n'
+        '        << "This kernel requires 10.x or 12.x architecture. '
+        'Current device has SM "\n'
+        '        << std::get<0>(device_props) << std::get<1>(device_props);'
+    )
+    if old2 in content:
+        content = content.replace(old2, new2)
+        patched = True
+
+    if patched:
+        with open(target, "w") as f:
+            f.write(content)
+        logger.debug("GB10 compat: patched TRTLLM runtime checks in %s",
+                     target)
+
+
 def _patch_trtllm_fused_moe_jit() -> None:
     """Add SM12x to TRTLLM fused MoE JIT supported_major_versions."""
     candidates: list[str] = []
@@ -290,6 +347,7 @@ def ensure_flashinfer_sm121_compat() -> None:
     _patch_quantization_utils(data_dir)
     _patch_arch_condition(data_dir)
     _copy_fp4_header(data_dir)
+    _patch_trtllm_fused_moe_runtime_checks(data_dir)
     _patch_trtllm_fused_moe_jit()
     _clear_moe_jit_cache()
     logger.info("GB10 compat: FlashInfer patches complete")
