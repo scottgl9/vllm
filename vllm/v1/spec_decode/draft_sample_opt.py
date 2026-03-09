@@ -141,7 +141,136 @@ class FP8LMHeadSampler:
 
 
 # ---------------------------------------------------------------------------
-# Option 3: FP8 post-quantization of MTP MoE expert weights
+# Option 3: FP8 post-quantization of MTP fc/lm_head layers
+# ---------------------------------------------------------------------------
+
+class FP8PostQuantLinear(torch.nn.Module):
+    """Drop-in nn.Linear replacement using FP8 weights.
+
+    Quantizes BF16/FP16 weight to float8_e4m3fn with per-tensor scaling.
+    Uses dynamic per-token activation quantization via torch._scaled_mm().
+    ~2x bandwidth reduction vs bf16 with good accuracy for draft tokens.
+    """
+
+    def __init__(
+        self,
+        weight_fp8: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: torch.Tensor | None,
+    ):
+        super().__init__()
+        self.weight_fp8 = weight_fp8
+        self.weight_scale = weight_scale
+        self.bias = bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_shape = x.shape
+        x = x.view(-1, orig_shape[-1])
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+
+        scale_a_val = x.abs().max().item() / fp8_max
+        scale_a = torch.tensor(scale_a_val, dtype=torch.float32, device=x.device)
+        x_fp8 = (x / scale_a_val).to(torch.float8_e4m3fn)
+
+        out = torch._scaled_mm(
+            x_fp8,
+            self.weight_fp8.t(),
+            out_dtype=x.dtype if x.dtype != torch.float8_e4m3fn else torch.bfloat16,
+            scale_a=scale_a,
+            scale_b=self.weight_scale,
+        )
+        if self.bias is not None:
+            out = out + self.bias
+        return out.view(*orig_shape[:-1], out.shape[-1])
+
+
+def apply_fp8_post_quant(model: torch.nn.Module, layer_patterns: list[str]) -> int:
+    """Post-quantize matching nn.Linear layers to FP8 in-place.
+
+    Walks model.named_modules(), matches layers whose name ends with a suffix
+    in ``layer_patterns``, and replaces them with FP8PostQuantLinear.
+
+    Args:
+        model: The model to quantize.
+        layer_patterns: List of name suffixes to match (e.g., ["fc", "lm_head"]).
+
+    Returns:
+        Number of layers converted.
+    """
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8_dtype).max
+    count = 0
+
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        if not any(name.endswith(pat) for pat in layer_patterns):
+            continue
+        weight = module.weight.data
+        if weight.dtype not in (torch.bfloat16, torch.float16):
+            continue
+
+        scale_val = weight.abs().max().item() / fp8_max
+        scale = torch.tensor(scale_val, dtype=torch.float32, device=weight.device)
+        weight_fp8 = (weight / scale_val).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+
+        bias = module.bias.data if module.bias is not None else None
+
+        fp8_linear = FP8PostQuantLinear(weight_fp8, scale, bias)
+
+        # Replace the module in its parent
+        parts = name.rsplit(".", 1)
+        if len(parts) == 2:
+            parent = model.get_submodule(parts[0])
+            setattr(parent, parts[1], fp8_linear)
+        else:
+            setattr(model, name, fp8_linear)
+
+        orig_mb = weight.numel() * weight.element_size() / 1024 / 1024
+        fp8_mb = weight_fp8.numel() / 1024 / 1024
+        logger.info(
+            "FP8 post-quantized %s: %.1f MB (bf16) -> %.1f MB (fp8)",
+            name, orig_mb, fp8_mb,
+        )
+        count += 1
+
+    return count
+
+
+def maybe_quantize_mtp_fp8(draft_model: torch.nn.Module) -> None:
+    """Post-quantize MTP fc/lm_head layers and MoE experts to FP8.
+
+    Called when VLLM_MTP_FP8=1. Converts:
+    - fc and lm_head nn.Linear layers to FP8 (via FP8PostQuantLinear)
+    - MoE expert weights to FP8 (via quantize_mtp_moe_fp8, skipped on SM120+)
+
+    Must be called before CUDA graph capture.
+    """
+    from vllm.platforms import current_platform
+
+    n_fc = apply_fp8_post_quant(draft_model, ["fc", "lm_head"])
+    logger.info(
+        "maybe_quantize_mtp_fp8: converted %d fc/lm_head layer(s) to FP8",
+        n_fc,
+    )
+
+    # MoE FP8 is skipped on SM120+ (Triton limitation)
+    if current_platform.has_device_capability(120):
+        logger.info(
+            "maybe_quantize_mtp_fp8: skipping MoE FP8 on SM120+ "
+            "(use VLLM_MTP_MOE_FP8=1 separately if needed)"
+        )
+        return
+
+    n_moe = quantize_mtp_moe_fp8(draft_model)
+    logger.info(
+        "maybe_quantize_mtp_fp8: converted %d MoE layer(s) to FP8",
+        n_moe,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Option 4: FP8 post-quantization of MTP MoE expert weights
 # ---------------------------------------------------------------------------
 
 def quantize_mtp_moe_fp8(mtp_model: torch.nn.Module) -> int:
