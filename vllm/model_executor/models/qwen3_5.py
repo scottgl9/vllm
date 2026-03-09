@@ -424,7 +424,12 @@ class Qwen3_5ForCausalLMBase(
             self,
             skip_prefixes=["mtp."],
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        from vllm.model_executor.layers.quantization.utils.nvfp4_post_quant import (
+            apply_nvfp4_post_quant,
+        )
+        apply_nvfp4_post_quant(self, ["in_proj_qkvz"])
+        return loaded
 
     def get_mrope_input_positions(
         self,
@@ -584,7 +589,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             self,
             skip_prefixes=["mtp."],
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        from vllm.model_executor.layers.quantization.utils.nvfp4_post_quant import (
+            apply_nvfp4_post_quant,
+        )
+        apply_nvfp4_post_quant(self, ["in_proj_qkvz"])
+        return loaded
 
     @classmethod
     def get_mamba_state_dtype_from_config(
