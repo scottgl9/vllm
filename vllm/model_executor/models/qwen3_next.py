@@ -1428,7 +1428,12 @@ class Qwen3NextForCausalLM(
             self,
             skip_prefixes=["mtp."],
         )
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        from vllm.model_executor.layers.quantization.utils.nvfp4_post_quant import (
+            apply_nvfp4_post_quant,
+        )
+        apply_nvfp4_post_quant(self, ["in_proj_qkvz"])
+        return loaded
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
