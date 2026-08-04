@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Laguna model compatible with HuggingFace weights."""
 
+import os
+import re
 from collections.abc import Iterable
 from itertools import islice
 
@@ -23,6 +25,8 @@ from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    LinearBase,
+    LinearMethodBase,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -52,6 +56,154 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 logger = init_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# GB10 FP8 post-quantization for layers this checkpoint's own NVFP4 quant
+# recipe left in BF16 (see `ignore` in config.json's quantization_config).
+#
+# Two independently gated pieces, both applied at load time (before CUDA
+# graph capture, from LagunaForCausalLM.load_weights):
+#
+#   VLLM_LAGUNA_ATTN_FP8=1
+#       FP8-quantize qkv_proj + o_proj on every layer. These run on every
+#       token of every layer (no MoE sparsity), so they dominate decode
+#       bandwidth despite being a modest fraction of total checkpoint size.
+#
+#   VLLM_LAGUNA_MOE_FP8=1
+#       FP8-quantize the routed-expert weights (w13=gate+up fused, w2=down)
+#       on layers 40-45. The checkpoint's own recipe already quantized every
+#       *other* layer's routed experts to NVFP4 and explicitly excluded
+#       layers 40-47 (closest to the output) as too sensitive for 4-bit.
+#       FP8 is a much gentler step down from BF16, so it's expected to be
+#       safe there; layers 46-47 are left out of this flag as the most
+#       output-adjacent (and therefore most cautious) of the excluded block.
+# ---------------------------------------------------------------------------
+
+_FP8_DTYPE = torch.float8_e4m3fn
+_FP8_MAX = torch.finfo(_FP8_DTYPE).max
+
+
+def _fp8_quantize_tensor(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-tensor FP8 (E4M3) quantize. Returns (fp8_weight, scale)."""
+    w32 = weight.float()
+    scale = (w32.abs().max() / _FP8_MAX).clamp(min=1e-12)
+    weight_fp8 = (w32 / scale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8_DTYPE)
+    return weight_fp8, scale.to(torch.float32)
+
+
+class _LagunaFp8LinearMethod(LinearMethodBase):
+    """Dynamic-activation FP8 W8A8 GEMM for an already FP8-quantized weight.
+
+    Installed as `layer.quant_method` *after* loading, replacing
+    `UnquantizedLinearMethod` in place. Only implements `apply()` — the
+    layer's weight has already been created and quantized by the caller, so
+    `create_weights()` is never invoked on this instance.
+
+    Swapping only `quant_method` (not the whole `LinearBase` module) keeps
+    the layer's own `forward()` — including TP splitting/all-reduce for
+    `QKVParallelLinear`/`RowParallelLinear` — completely intact; this method
+    only needs to compute the same local partial GEMM `UnquantizedLinearMethod`
+    would have.
+    """
+
+    def create_weights(self, layer: torch.nn.Module, *args, **kwargs):
+        raise NotImplementedError(
+            "_LagunaFp8LinearMethod is only installed post-load onto layers "
+            "with pre-existing FP8 weights; it does not create weights."
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        orig_shape = x.shape
+        x2d = x.reshape(-1, orig_shape[-1])
+
+        x_fp8, scale_a = _fp8_quantize_tensor(x2d)
+        out_dtype = x.dtype if x.dtype != _FP8_DTYPE else torch.bfloat16
+        out = torch._scaled_mm(
+            x_fp8,
+            layer.weight.t(),
+            out_dtype=out_dtype,
+            scale_a=scale_a,
+            scale_b=layer.weight_scale,
+        )
+        if bias is not None:
+            out = out + bias
+        return out.view(*orig_shape[:-1], out.shape[-1])
+
+
+def _apply_attn_fp8_post_quant(model: torch.nn.Module, name_suffixes: list[str]) -> int:
+    """FP8 post-quantize LinearBase layers (qkv_proj, o_proj, ...) in place.
+
+    Unlike a plain `nn.Linear` weight swap, this preserves each layer's own
+    TP/bias/return_bias semantics (see `_LagunaFp8LinearMethod`).
+    """
+    from vllm.model_executor.utils import replace_parameter
+
+    count = 0
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, LinearBase):
+            continue
+        if not any(name.endswith(suf) for suf in name_suffixes):
+            continue
+        weight = module.weight.data
+        if weight.dtype not in (torch.bfloat16, torch.float16):
+            continue
+
+        weight_fp8, scale = _fp8_quantize_tensor(weight)
+        replace_parameter(
+            module, "weight", torch.nn.Parameter(weight_fp8, requires_grad=False)
+        )
+        module.weight_scale = scale
+        module.quant_method = _LagunaFp8LinearMethod()
+
+        orig_mb = weight.numel() * weight.element_size() / 1024 / 1024
+        fp8_mb = weight_fp8.numel() / 1024 / 1024
+        logger.info(
+            "Laguna FP8 post-quant: %s: %.1f MB (bf16) -> %.1f MB (fp8)",
+            name,
+            orig_mb,
+            fp8_mb,
+        )
+        count += 1
+    return count
+
+
+_MOE_EXPERTS_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.mlp\.experts$")
+
+
+def _laguna_moe_fp8_layer_filter(name: str) -> bool:
+    """Matches `...layers.{40..45}.mlp.experts` — see module docstring above
+    for why 40-45 specifically (not 46-47, and not the NVFP4-quantized 0-39)."""
+    m = _MOE_EXPERTS_LAYER_RE.search(name)
+    return m is not None and 40 <= int(m.group(1)) <= 45
+
+
+def maybe_quantize_laguna_fp8(model: torch.nn.Module) -> None:
+    """Apply the GB10 FP8 post-quant flags for Laguna, if set.
+
+    Must be called before CUDA graph capture (i.e. from load_weights).
+    """
+    if os.environ.get("VLLM_LAGUNA_ATTN_FP8", "0") == "1":
+        n = _apply_attn_fp8_post_quant(model, ["qkv_proj", "o_proj"])
+        logger.info(
+            "VLLM_LAGUNA_ATTN_FP8=1: quantized %d attention linear layer(s) to FP8",
+            n,
+        )
+
+    if os.environ.get("VLLM_LAGUNA_MOE_FP8", "0") == "1":
+        from vllm.v1.spec_decode.draft_sample_opt import quantize_mtp_moe_fp8
+
+        n = quantize_mtp_moe_fp8(model, name_filter=_laguna_moe_fp8_layer_filter)
+        logger.info(
+            "VLLM_LAGUNA_MOE_FP8=1: quantized %d routed-expert MoE layer(s) "
+            "(layers 40-45) to FP8",
+            n,
+        )
 
 
 class LagunaMLP(nn.Module):
@@ -767,4 +919,6 @@ class LagunaForCausalLM(nn.Module, SupportsPP, SupportsLoRA, SupportsEagle3):
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        maybe_quantize_laguna_fp8(self)
+        return loaded

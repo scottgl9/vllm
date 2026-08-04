@@ -18,6 +18,7 @@ Usage: set VLLM_DRAFT_SAMPLE_OPT=compiled|fp8 environment variable.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
@@ -273,8 +274,11 @@ def maybe_quantize_mtp_fp8(draft_model: torch.nn.Module) -> None:
 # Option 4: FP8 post-quantization of MTP MoE expert weights
 # ---------------------------------------------------------------------------
 
-def quantize_mtp_moe_fp8(mtp_model: torch.nn.Module) -> int:
-    """Post-quantize MTP MoE expert weights from bf16 to FP8 W8A8.
+def quantize_mtp_moe_fp8(
+    mtp_model: torch.nn.Module,
+    name_filter: Callable[[str], bool] | None = None,
+) -> int:
+    """Post-quantize MoE expert weights from bf16 to FP8 W8A8.
 
     Must be called BEFORE CUDA graph capture so the graphs capture the FP8
     kernel path. Replaces quant_method.moe_quant_config and quant_method.kernel
@@ -284,7 +288,15 @@ def quantize_mtp_moe_fp8(mtp_model: torch.nn.Module) -> int:
     Halves active-expert memory bandwidth per draft step:
       35B: 50 MB -> 25 MB/step, 122B: 151 MB -> 75 MB/step.
 
-    Returns the number of MoE layers quantized.
+    Args:
+        mtp_model: Model (or submodule) to walk for MoE layers.
+        name_filter: Optional predicate on the module's dotted name (as
+            yielded by ``named_modules()``); only matching layers are
+            quantized. ``None`` (default) quantizes every eligible layer,
+            preserving the original MTP-only behavior.
+
+    Returns:
+        The number of MoE layers quantized.
     """
     from vllm.model_executor.layers.fused_moe.config import (
         fp8_w8a8_moe_quant_config,
@@ -302,6 +314,8 @@ def quantize_mtp_moe_fp8(mtp_model: torch.nn.Module) -> int:
     count = 0
 
     for name, layer in mtp_model.named_modules():
+        if name_filter is not None and not name_filter(name):
+            continue
         qm = getattr(layer, "quant_method", None)
         if not isinstance(qm, UnquantizedFusedMoEMethod):
             continue
