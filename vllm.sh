@@ -151,7 +151,7 @@ cmd_build() {
     source "${VENV_DIR}/bin/activate"
 
     # Pin the pytorch whl index for ALL subsequent pip calls in this shell.
-    # Without this, pip install -r requirements/build.txt re-resolves torch from
+    # Without this, pip install -r requirements/build/cuda.txt re-resolves torch from
     # PyPI and pulls the CPU wheel, overwriting the cu130 build.
     export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu130"
 
@@ -159,7 +159,7 @@ cmd_build() {
     pip install -q --upgrade pip
 
     info "Installing PyTorch 2.10 for CUDA 13.0 (cu130, aarch64)..."
-    pip install "torch==2.10.0+cu130" --index-url https://download.pytorch.org/whl/cu130
+    pip install "torch==2.13.0+cu130" --index-url https://download.pytorch.org/whl/cu130
 
     info "Installing Triton >=3.3.0 (SM121a ptxas support)..."
     # triton <3.3.0 produces a fatal ptxas error on sm_121a
@@ -169,12 +169,12 @@ cmd_build() {
     pip install flashinfer-python --pre
 
     info "Installing vLLM build requirements..."
-    pip install -r "${VLLM_DIR}/requirements/build.txt"
+    pip install -r "${VLLM_DIR}/requirements/build/cuda.txt"
 
-    # Force-reinstall cu130 before cmake: requirements/build.txt has bare
-    # torch==2.10.0 which pip may resolve to the CPU wheel from PyPI.
+    # Force-reinstall cu130 before cmake: requirements/build/cuda.txt has bare
+    # torch==2.13.0 which pip may resolve to the CPU wheel from PyPI.
     info "Re-pinning torch+cu130 before CUDA compilation..."
-    pip install --force-reinstall --no-deps "torch==2.10.0+cu130" \
+    pip install --force-reinstall --no-deps "torch==2.13.0+cu130" \
         --index-url https://download.pytorch.org/whl/cu130
 
     # GB10-specific source modifications on this branch:
@@ -195,7 +195,7 @@ cmd_build() {
 
     # pip install -e . can drag in CPU torch via transitive deps; re-pin last.
     info "Pinning torch+cu130 (final reinstall)..."
-    pip install --force-reinstall --no-deps "torch==2.10.0+cu130" \
+    pip install --force-reinstall --no-deps "torch==2.13.0+cu130" \
         --index-url https://download.pytorch.org/whl/cu130
 
     info "Verifying installation..."
@@ -232,7 +232,7 @@ cmd_build() {
 
     if [[ "${TORCH_CUDA}" == "None" || "${TORCH_CUDA}" == "" ]]; then
         warn "torch.version.cuda is None — CPU-only torch was installed."
-        warn "Fix: pip install torch==2.10.0+cu130 --index-url https://download.pytorch.org/whl/cu130"
+        warn "Fix: pip install torch==2.13.0+cu130 --index-url https://download.pytorch.org/whl/cu130"
     else
         success "Build complete. Log: /tmp/vllm-gb10-build.log"
     fi
