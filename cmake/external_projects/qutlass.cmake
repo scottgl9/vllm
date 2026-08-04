@@ -85,8 +85,14 @@ else()
 endif()
 
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND QUTLASS_ARCHS)
+  # NOTE: csrc/qutlass_registration.cpp (REGISTER_EXTENSION stub) is
+  # intentionally NOT included here. Its comment assumes bindings.cpp only
+  # uses TORCH_LIBRARY and needs a separate PyInit_ stub to be importable,
+  # but the pinned upstream qutlass commit's bindings.cpp also defines its
+  # own PYBIND11_MODULE(TORCH_EXTENSION_NAME, ...), which already provides
+  # PyInit__qutlass_C and triggers the TORCH_LIBRARY registration on import.
+  # Including both causes a duplicate PyInit__qutlass_C link error.
   set(QUTLASS_SOURCES
-    csrc/qutlass_registration.cpp
     ${qutlass_SOURCE_DIR}/qutlass/csrc/bindings.cpp
     ${qutlass_SOURCE_DIR}/qutlass/csrc/gemm.cu
     ${qutlass_SOURCE_DIR}/qutlass/csrc/gemm_ada.cu
@@ -137,14 +143,22 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND QUTLASS_ARCHS)
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
     ARCHITECTURES ${VLLM_GPU_ARCHES}
     INCLUDE_DIRECTORIES ${QUTLASS_INCLUDES}
-    USE_SABI 3
+    # No USE_SABI: QuTLASS's upstream pybind11 bindings use full-CPython-API
+    # features (custom_type_setup, PyThreadState/PyInterpreterState internals,
+    # vectorcall, etc.) that pybind11 itself does not support under any
+    # Py_LIMITED_API level, so this target is built against the concrete
+    # Python 3.12 ABI instead of the stable/limited ABI.
     WITH_SOABI)
 
+  # NOTE: no TORCH_TARGET_VERSION here. QuTLASS's upstream headers (fetched
+  # from IST-DASLab/qutlass.git) unconditionally include full ATen/torch
+  # headers (torch/extension.h, ATen/ATen.h, etc.) which #error out when
+  # TORCH_TARGET_VERSION or TORCH_STABLE_ONLY is defined — those headers
+  # haven't been updated for vLLM's stable-ABI build path.
   target_compile_definitions(_qutlass_C PRIVATE
     QUTLASS_MINIMAL_BUILD=1
     TARGET_CUDA_ARCH=${QUTLASS_TARGET_CC}
     CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1
-    TORCH_TARGET_VERSION=0x020B000000000000ULL
     USE_CUDA)
 
   set_property(SOURCE ${QUTLASS_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
