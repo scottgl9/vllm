@@ -49,6 +49,10 @@ PYTHON="python3.12"
 
 # ── Context window default ────────────────────────────────────────────────────
 # Override before calling: MAX_MODEL_LEN=32768 ./vllm.sh <preset>
+# Captured before the default below is applied, so presets whose own default
+# differs from the script-wide 131072 (e.g. laguna's 262144) can tell "user
+# explicitly set MAX_MODEL_LEN" apart from "unset, use my own default".
+MAX_MODEL_LEN_RAW="${MAX_MODEL_LEN:-}"
 #MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 
@@ -444,7 +448,10 @@ cmd_laguna() {
 
     local model="${LAGUNA_MODEL:-poolside/Laguna-S-2.1-NVFP4}"
     local draft_model="${LAGUNA_DRAFT_MODEL:-poolside/Laguna-S-2.1-DFlash-NVFP4}"
-    local ctx="${MAX_MODEL_LEN:-262144}"
+    # Laguna's context default (262144) differs from the script-wide default
+    # (131072), so fall back on the pre-default raw value, not MAX_MODEL_LEN
+    # itself (which is always already set by the time this runs).
+    local ctx="${MAX_MODEL_LEN_RAW:-262144}"
 
     info "Preset: Laguna-S-2.1-NVFP4 (poolside, DFlash speculative decoding)"
     info "  Model : ${model}"
@@ -460,7 +467,8 @@ cmd_laguna() {
         --reasoning-parser poolside_v1 \
         --max-num-seqs "${MAX_NUM_SEQS:-4}" \
         --max-model-len "${ctx}" \
-        --gpu-memory-utilization "${GPU_MEM_UTIL:-0.85}" \
+        --kv-cache-dtype fp8 \
+        --gpu-memory-utilization "${GPU_MEM_UTIL:-0.92}" \
         "${SERVER_ARGS[@]}" \
         "$@"
 }
