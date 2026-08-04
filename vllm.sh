@@ -10,6 +10,7 @@
 #   Qwen3-Coder-Next-NVFP4 [args] GadflyII Qwen3-Coder-Next NVFP4
 #   Qwen3-Coder-Next-FP8 [args]   Qwen/Qwen3-Coder-Next dense FP8
 #   minimax [args]                 MiniMax M2.5 REAP 139B NVFP4
+#   laguna [args]                  Laguna-S-2.1-NVFP4 + DFlash speculative decoding
 #
 # Context window (default 65536 — override with MAX_MODEL_LEN):
 #   MAX_MODEL_LEN=32768 ./vllm.sh Qwen3.5-NVFP4
@@ -24,6 +25,8 @@
 #   QWEN3_CODER_NVFP4_MODEL=GadflyII/...         ./vllm.sh Qwen3-Coder-Next-NVFP4
 #   QWEN3_CODER_MODEL=Qwen/Qwen3-Coder-Next-FP8  ./vllm.sh Qwen3-Coder-Next-FP8
 #   MINIMAX_MODEL=/path/to/model                  ./vllm.sh minimax
+#   LAGUNA_MODEL=poolside/Laguna-S-2.1-NVFP4       ./vllm.sh laguna
+#   LAGUNA_DRAFT_MODEL=poolside/...-DFlash-NVFP4  ./vllm.sh laguna
 #
 # Key environment overrides:
 #   MAX_MODEL_LEN              Context window tokens (default: 65536)
@@ -54,9 +57,10 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 # Standard server binding (all presets)
 SERVER_ARGS=(--host 0.0.0.0 --port 8000)
 
-# Common to all Qwen3 presets: model name + tool calling
+# Common to all Qwen3 presets: tool calling (served-model-name is per-preset —
+# it used to live here too, which mislabeled the Qwen3.5 presets as
+# "qwen3-coder-next")
 QWEN3_ARGS=(
-    --served-model-name qwen3-coder-next
     --enable-auto-tool-choice
     --tool-call-parser qwen3_coder
 )
@@ -158,7 +162,7 @@ cmd_build() {
     info "Upgrading pip..."
     pip install -q --upgrade pip
 
-    info "Installing PyTorch 2.10 for CUDA 13.0 (cu130, aarch64)..."
+    info "Installing PyTorch 2.13 for CUDA 13.0 (cu130, aarch64)..."
     pip install "torch==2.13.0+cu130" --index-url https://download.pytorch.org/whl/cu130
 
     info "Installing Triton >=3.3.0 (SM121a ptxas support)..."
@@ -384,6 +388,7 @@ cmd_qwen3_coder_next_nvfp4() {
 
     cmd_launch \
         --model "${model}" \
+        --served-model-name qwen3-coder-next \
         --quantization compressed-tensors \
         --kv-cache-dtype fp8_e4m3 \
         --gpu-memory-utilization 0.8 \
@@ -405,6 +410,7 @@ cmd_qwen3_coder_next_fp8() {
 
     cmd_launch \
         --model "${model}" \
+        --served-model-name qwen3-coder-next \
         --kv-cache-dtype fp8_e4m3 \
         --gpu-memory-utilization 0.86 \
         --max-num-seqs 4 \
@@ -431,6 +437,34 @@ cmd_minimax() {
         "$@"
 }
 
+cmd_laguna() {
+    # CuteDSL kernels used by NVFP4/DFlash JIT-compile for this arch target.
+    # Per poolside's own DGX Spark launch recipe for this model.
+    export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_121a}"
+
+    local model="${LAGUNA_MODEL:-poolside/Laguna-S-2.1-NVFP4}"
+    local draft_model="${LAGUNA_DRAFT_MODEL:-poolside/Laguna-S-2.1-DFlash-NVFP4}"
+    local ctx="${MAX_MODEL_LEN:-262144}"
+
+    info "Preset: Laguna-S-2.1-NVFP4 (poolside, DFlash speculative decoding)"
+    info "  Model : ${model}"
+    info "  Draft : ${draft_model}"
+    info "  MaxLen: ${ctx}"
+
+    cmd_launch \
+        --model "${model}" \
+        --served-model-name laguna \
+        --speculative-config '{"model":"'"${draft_model}"'","num_speculative_tokens":'"${NUM_SPEC_TOKENS:-7}"',"method":"dflash"}' \
+        --enable-auto-tool-choice \
+        --tool-call-parser poolside_v1 \
+        --reasoning-parser poolside_v1 \
+        --max-num-seqs "${MAX_NUM_SEQS:-4}" \
+        --max-model-len "${ctx}" \
+        --gpu-memory-utilization "${GPU_MEM_UTIL:-0.85}" \
+        "${SERVER_ARGS[@]}" \
+        "$@"
+}
+
 cmd_shell() {
     [[ -d "${VENV_DIR}" ]] || die "Venv not found at ${VENV_DIR}. Run: ./vllm.sh build"
     info "Activating vLLM venv — type 'deactivate' to exit"
@@ -452,6 +486,7 @@ Commands:
   Qwen3-Coder-Next-NVFP4 [args] GadflyII/Qwen3-Coder-Next-NVFP4
   Qwen3-Coder-Next-FP8 [args]   Qwen/Qwen3-Coder-Next-FP8
   minimax [args]                 MiniMax M2.5 REAP 139B NVFP4
+  laguna [args]                  Laguna-S-2.1-NVFP4, DFlash speculative decoding
 
 Context window (default: ${MAX_MODEL_LEN}):
   MAX_MODEL_LEN=32768 ./vllm.sh Qwen3.5-NVFP4
@@ -462,6 +497,8 @@ Model path overrides:
   QWEN3_CODER_NVFP4_MODEL=<path>  Override Qwen3-Coder-Next-NVFP4 model
   QWEN3_CODER_MODEL=<path>        Override Qwen3-Coder-Next-FP8 model
   MINIMAX_MODEL=<path>             Override MiniMax model path
+  LAGUNA_MODEL=<path>              Override Laguna-S-2.1-NVFP4 model
+  LAGUNA_DRAFT_MODEL=<path>        Override Laguna DFlash draft model
 
 Environment overrides:
   MAX_MODEL_LEN=N              Context window tokens (default: 65536)
@@ -490,6 +527,7 @@ case "${CMD}" in
     Qwen3-Coder-Next-NVFP4|qwen3-coder-next-nvfp4) cmd_qwen3_coder_next_nvfp4 "$@" ;;
     Qwen3-Coder-Next-FP8|qwen3-coder-next-fp8) cmd_qwen3_coder_next_fp8 "$@" ;;
     minimax|MiniMax) cmd_minimax "$@" ;;
+    laguna|Laguna) cmd_laguna "$@" ;;
     ""|help|-h|--help) usage ;;
     *) die "Unknown command: ${CMD}. Run './vllm.sh help' for usage." ;;
 esac
