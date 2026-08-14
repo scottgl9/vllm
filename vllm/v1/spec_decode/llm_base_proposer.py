@@ -1679,6 +1679,27 @@ class SpecDecodeBaseProposer:
         logits_processor = self.model.logits_processor
         org_vocab_size = logits_processor.org_vocab_size
 
+        # Both "compiled" and "fp8" read lm_head.weight directly assuming a
+        # plain dense BF16/FP16 tensor. If the checkpoint ships lm_head
+        # pre-quantized (e.g. compressed-tensors FP8), its quant_method's
+        # process_weights_after_loading may have already repacked .weight
+        # into a kernel-specific packed layout (e.g. Marlin's GEMM tiles,
+        # required here via VLLM_TEST_FORCE_FP8_MARLIN=1 on GB10) — neither
+        # a real weight matrix nor BF16/FP16. Fall back to the default path
+        # (self.model.compute_logits, which correctly dispatches through
+        # lm_head's actual quant_method) rather than silently computing
+        # garbage from misinterpreted packed bytes.
+        if lm_head.weight.dtype not in (torch.bfloat16, torch.float16):
+            logger.warning(
+                "VLLM_DRAFT_SAMPLE_OPT=%s requires an unquantized (BF16/FP16) "
+                "lm_head, but this model's lm_head.weight is %s (already "
+                "quantized/kernel-packed). Falling back to default draft "
+                "sampling.",
+                mode,
+                lm_head.weight.dtype,
+            )
+            return
+
         if mode == "compiled":
             from vllm.v1.spec_decode.draft_sample_opt import (
                 compiled_greedy_sample,
