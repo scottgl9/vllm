@@ -142,116 +142,159 @@ class FP8LMHeadSampler:
 
 
 # ---------------------------------------------------------------------------
-# Option 3: FP8 post-quantization of MTP fc/lm_head layers
+# Option 3: FP8 post-quantization of MTP linear layers (fc, attn, mlp)
 # ---------------------------------------------------------------------------
 
-class FP8PostQuantLinear(torch.nn.Module):
-    """Drop-in nn.Linear replacement using FP8 weights.
 
-    Quantizes BF16/FP16 weight to float8_e4m3fn with per-tensor scaling.
-    Uses dynamic per-token activation quantization via torch._scaled_mm().
-    ~2x bandwidth reduction vs bf16 with good accuracy for draft tokens.
+class Fp8PostQuantLinearMethod:
+    """Minimal quant_method adapter for post-quantized FP8 linear layers.
+
+    Installed by ``post_quantize_linear_to_fp8`` in place of the layer's
+    original quant_method. The layer keeps its original class (e.g.
+    ColumnParallelLinear) and forward() unchanged -- only .weight,
+    .weight_scale, and .quant_method are swapped -- so return_bias,
+    gather_output, and skip_bias_add semantics all continue to work exactly
+    as before. Mirrors Fp4PostQuantLinearMethod in nvfp4_post_quant.py.
+
+    Quantizes weight to float8_e4m3fn with a single per-tensor scale;
+    activations are dynamically quantized per-call via torch._scaled_mm().
     """
 
-    def __init__(
+    def apply(
         self,
-        weight_fp8: torch.Tensor,
-        weight_scale: torch.Tensor,
-        bias: torch.Tensor | None,
-    ):
-        super().__init__()
-        self.weight_fp8 = weight_fp8
-        self.weight_scale = weight_scale
-        self.bias = bias
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         orig_shape = x.shape
         x = x.view(-1, orig_shape[-1])
         fp8_max = torch.finfo(torch.float8_e4m3fn).max
 
-        scale_a_val = x.abs().max().item() / fp8_max
+        scale_a_val = x.abs().max().clamp(min=1e-12).item() / fp8_max
         scale_a = torch.tensor(scale_a_val, dtype=torch.float32, device=x.device)
         x_fp8 = (x / scale_a_val).to(torch.float8_e4m3fn)
 
         out = torch._scaled_mm(
             x_fp8,
-            self.weight_fp8.t(),
+            layer.weight.t(),
             out_dtype=x.dtype if x.dtype != torch.float8_e4m3fn else torch.bfloat16,
             scale_a=scale_a,
-            scale_b=self.weight_scale,
+            scale_b=layer.weight_scale,
         )
-        if self.bias is not None:
-            out = out + self.bias
+        if bias is not None:
+            out = out + bias
         return out.view(*orig_shape[:-1], out.shape[-1])
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        pass  # weights are already prepared
 
-def apply_fp8_post_quant(model: torch.nn.Module, layer_patterns: list[str]) -> int:
-    """Post-quantize matching nn.Linear layers to FP8 in-place.
 
-    Walks model.named_modules(), matches layers whose name ends with a suffix
-    in ``layer_patterns``, and replaces them with FP8PostQuantLinear.
+def post_quantize_linear_to_fp8(layer: torch.nn.Module, name: str) -> bool:
+    """Post-quantize a BF16/FP16 linear layer's weight to FP8 in-place.
+
+    Returns True if quantization was applied, False if skipped (weight is
+    already quantized, or not BF16/FP16).
+    """
+    weight = layer.weight.data
+    if weight.dtype not in (torch.bfloat16, torch.float16):
+        logger.debug(
+            "Skipping FP8 post-quant for %s: dtype is %s (not BF16/FP16)",
+            name,
+            weight.dtype,
+        )
+        return False
+
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8_dtype).max
+    scale_val = weight.abs().max().clamp(min=1e-12).item() / fp8_max
+    weight_scale = torch.tensor(scale_val, dtype=torch.float32, device=weight.device)
+    weight_fp8 = (weight / scale_val).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+
+    del layer.weight
+    layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
+    layer.quant_method = Fp8PostQuantLinearMethod()
+
+    orig_mb = weight.numel() * weight.element_size() / 1024 / 1024
+    fp8_mb = weight_fp8.numel() / 1024 / 1024
+    logger.info(
+        "FP8 post-quantized %s: %.1f MB (bf16) -> %.1f MB (fp8)",
+        name, orig_mb, fp8_mb,
+    )
+    return True
+
+
+def apply_fp8_post_quant(
+    model: torch.nn.Module,
+    layer_patterns: list[str],
+    name_filter: Callable[[str], bool] | None = None,
+) -> int:
+    """Post-quantize matching linear layers to FP8 in-place.
+
+    Walks model.named_modules() and converts any BF16/FP16 linear layer
+    whose name ends with a suffix in ``layer_patterns`` to FP8. Matches on
+    hasattr(module, "weight") rather than isinstance(module, torch.nn.Linear)
+    because vLLM's parallel linear layers (ColumnParallelLinear,
+    RowParallelLinear, QKVParallelLinear, ...) subclass nn.Module via
+    LinearBase/PluggableLayer, not nn.Linear -- an isinstance(nn.Linear)
+    check silently matches zero layers on any real vLLM model.
 
     Args:
         model: The model to quantize.
         layer_patterns: List of name suffixes to match (e.g., ["fc", "lm_head"]).
+        name_filter: Optional predicate on the module's dotted name; only
+            matching layers are quantized. Use this to scope quantization to
+            a submodule (e.g. ``lambda n: n.startswith("mtp.")``) since
+            layer_patterns like "q_proj"/"gate_proj" would otherwise also
+            match the main model's own (already-quantized) layers.
 
     Returns:
         Number of layers converted.
     """
-    fp8_dtype = torch.float8_e4m3fn
-    fp8_max = torch.finfo(fp8_dtype).max
     count = 0
 
     for name, module in list(model.named_modules()):
-        if not isinstance(module, torch.nn.Linear):
+        if not hasattr(module, "weight"):
             continue
         if not any(name.endswith(pat) for pat in layer_patterns):
             continue
-        weight = module.weight.data
-        if weight.dtype not in (torch.bfloat16, torch.float16):
+        if name_filter is not None and not name_filter(name):
             continue
-
-        scale_val = weight.abs().max().item() / fp8_max
-        scale = torch.tensor(scale_val, dtype=torch.float32, device=weight.device)
-        weight_fp8 = (weight / scale_val).clamp(-fp8_max, fp8_max).to(fp8_dtype)
-
-        bias = module.bias.data if module.bias is not None else None
-
-        fp8_linear = FP8PostQuantLinear(weight_fp8, scale, bias)
-
-        # Replace the module in its parent
-        parts = name.rsplit(".", 1)
-        if len(parts) == 2:
-            parent = model.get_submodule(parts[0])
-            setattr(parent, parts[1], fp8_linear)
-        else:
-            setattr(model, name, fp8_linear)
-
-        orig_mb = weight.numel() * weight.element_size() / 1024 / 1024
-        fp8_mb = weight_fp8.numel() / 1024 / 1024
-        logger.info(
-            "FP8 post-quantized %s: %.1f MB (bf16) -> %.1f MB (fp8)",
-            name, orig_mb, fp8_mb,
-        )
-        count += 1
+        if post_quantize_linear_to_fp8(module, name):
+            count += 1
 
     return count
 
 
 def maybe_quantize_mtp_fp8(draft_model: torch.nn.Module) -> None:
-    """Post-quantize MTP fc/lm_head layers and MoE experts to FP8.
+    """Post-quantize MTP linear layers and MoE experts to FP8.
 
-    Called when VLLM_MTP_FP8=1. Converts:
-    - fc and lm_head nn.Linear layers to FP8 (via FP8PostQuantLinear)
+    Called when VLLM_MTP_FP8=1. Converts, scoped to the mtp.* submodule only:
+    - fc, self_attn q/k/v/o proj, and mlp gate/up/down proj to FP8 (via
+      apply_fp8_post_quant)
     - MoE expert weights to FP8 (via quantize_mtp_moe_fp8, skipped on SM120+)
 
     Must be called before CUDA graph capture.
     """
     from vllm.platforms import current_platform
 
-    n_fc = apply_fp8_post_quant(draft_model, ["fc", "lm_head"])
+    n_fc = apply_fp8_post_quant(
+        draft_model,
+        [
+            "fc",
+            "lm_head",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+        name_filter=lambda n: n.startswith("mtp."),
+    )
     logger.info(
-        "maybe_quantize_mtp_fp8: converted %d fc/lm_head layer(s) to FP8",
+        "maybe_quantize_mtp_fp8: converted %d MTP linear layer(s) to FP8",
         n_fc,
     )
 

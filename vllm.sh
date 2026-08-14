@@ -292,6 +292,7 @@ cmd_launch() {
     info "Launching vLLM OpenAI-compatible server"
     info "  VLLM_NVFP4_GEMM_BACKEND = ${VLLM_NVFP4_GEMM_BACKEND}"
     info "  VLLM_DRAFT_SAMPLE_OPT  = ${VLLM_DRAFT_SAMPLE_OPT:-none}"
+    info "  VLLM_MTP_FP8           = ${VLLM_MTP_FP8:-0}"
     info "  VLLM_MTP_MOE_FP8       = ${VLLM_MTP_MOE_FP8:-0}"
     info "  VLLM_QUANTIZE_LM_HEAD   = ${VLLM_QUANTIZE_LM_HEAD:-<unset>}"
     info "  SAFETENSORS_FAST_GPU    = ${SAFETENSORS_FAST_GPU}"
@@ -385,6 +386,12 @@ cmd_qwen35_35b_nvfp4() {
 }
 
 cmd_qwen38() {
+    # FP8 post-quant for the MTP module (fc + self_attn q/k/v/o + mlp
+    # gate/up/down): ~849 MB BF16 -> ~425 MB FP8. The base checkpoint already
+    # ships attention/mlp NVFP4+FP8 quantized; the MTP head is the only
+    # substantial BF16 weight mass left in the hot decode-step path.
+    export VLLM_MTP_FP8="${VLLM_MTP_FP8:-1}"
+
     local model="${QWEN38_MODEL:-unsloth/Qwen3.8-27B-NVFP4}"
     # Qwen3.8-27B-NVFP4's native context (262144, config.json max_position_embeddings)
     # differs from the script-wide default (131072) — same MAX_MODEL_LEN_RAW
