@@ -24,6 +24,8 @@
 #   QWEN35_MODEL=/path/to/snapshot               ./vllm.sh Qwen3.5-NVFP4
 #   QWEN35_35B_MODEL=Sehyo/Qwen3.5-35B-A3B-NVFP4 ./vllm.sh Qwen3.5-35B-NVFP4
 #   QWEN38_MODEL=unsloth/Qwen3.8-27B-NVFP4        ./vllm.sh qwen38
+#   SPEC_METHOD=dspark|mtp|none (default dspark)   ./vllm.sh qwen38
+#   QWEN38_DSPARK_MODEL=<local compat copy path>  ./vllm.sh qwen38
 #   QWEN3_CODER_NVFP4_MODEL=GadflyII/...         ./vllm.sh Qwen3-Coder-Next-NVFP4
 #   QWEN3_CODER_MODEL=Qwen/Qwen3-Coder-Next-FP8  ./vllm.sh Qwen3-Coder-Next-FP8
 #   MINIMAX_MODEL=/path/to/model                  ./vllm.sh minimax
@@ -110,6 +112,19 @@ export CUDA_NVCC_FLAGS="${CUDA_NVCC_FLAGS:---threads 4}"
 setup_runtime_env() {
     export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
     export TRITON_PTXAS_PATH="${CUDA_HOME}/bin/ptxas"
+    # FlashInfer JIT-compiles some kernels (e.g. XQA batch decode, hit during
+    # CUDA graph capture with certain attention/speculative-decoding
+    # combinations) via nvcc looked up on PATH, not via CUDA_HOME. An
+    # interactive login shell usually has ${CUDA_HOME}/bin on PATH already
+    # (via .bashrc/.profile) so this was easy to miss when only testing
+    # interactively — but systemd services don't source shell profiles, so
+    # nvcc silently wasn't found there, and FlashInfer fell back with
+    # "RuntimeError: FlashInfer backend is not available". Make it explicit
+    # so vllm.sh doesn't depend on the caller's shell setup.
+    case ":${PATH}:" in
+        *":${CUDA_HOME}/bin:"*) ;;
+        *) export PATH="${CUDA_HOME}/bin:${PATH}" ;;
+    esac
 
     # CUDA kernel cache — persists JIT-compiled kernels across restarts
     export CUDA_CACHE_PATH="${HOME}/.nv/ComputeCache"
@@ -405,9 +420,8 @@ cmd_qwen35_35b_nvfp4() {
 
 cmd_qwen38() {
     # FP8 post-quant for the MTP module (fc + self_attn q/k/v/o + mlp
-    # gate/up/down): ~849 MB BF16 -> ~425 MB FP8. The base checkpoint already
-    # ships attention/mlp NVFP4+FP8 quantized; the MTP head is the only
-    # substantial BF16 weight mass left in the hot decode-step path.
+    # gate/up/down): ~849 MB BF16 -> ~425 MB FP8. Only used when
+    # SPEC_METHOD=mtp; harmless/unread otherwise.
     export VLLM_MTP_FP8="${VLLM_MTP_FP8:-1}"
 
     local model="${QWEN38_MODEL:-unsloth/Qwen3.8-27B-NVFP4}"
@@ -416,14 +430,50 @@ cmd_qwen38() {
     # fallback pattern as laguna, so an explicit MAX_MODEL_LEN isn't clobbered.
     local ctx="${MAX_MODEL_LEN_RAW:-262144}"
 
+    # 0.85 (vs. the script-wide default of unset/lower): this model's weights
+    # + non-torch overhead is only ~31 GiB with speculative decoding on (~24
+    # GiB without), tiny against GB10's 121.63 GiB unified memory — 0.8 left
+    # ~44 GiB of KV cache headroom unused. vLLM's own "fully utilize" hint at
+    # 0.8 was ~71 GiB KV cache; 0.85 targets ~68 GiB, leaving a few GiB of
+    # margin for the other process already sharing this GPU rather than
+    # maxing out to the hint.
+    #
+    # SPEC_METHOD=dspark (default) | mtp | none. Benchmarked 2026-08-14 (see
+    # QWEN38_FP8_POSTQUANT_ANALYSIS.md / speed test transcript): DSpark
+    # 36.49 tps decode vs MTP 27.02 tps (+35%) vs no speculation 11.43 tps,
+    # all against this same NVFP4 target — DSpark wins outright, so it's the
+    # default. DSpark's own checkpoint (RadixArk/Qwen3.8-27B-DSpark)
+    # declares architectures=["DSparkDraftModel"] in its config.json, which
+    # vLLM's registry maps to the DeepSeek-V4 DSpark variant instead of the
+    # Qwen3 one (registered under "Qwen3DSparkModel") — needs a local compat
+    # copy with that one field patched; see setup instructions in
+    # REBASE_20260814_BUGS.md. QWEN38_DSPARK_MODEL points at it.
     local spec_args=()
-    if [[ "${DISABLE_MTP:-}" != "1" ]]; then
-        # Model ships its own MTP head (model_mtp.safetensors, mtp_num_hidden_layers=1
-        # in config.json) — same self-contained MTP as the Qwen3.5 presets.
-        spec_args=(--speculative-config '{"method":"mtp","num_speculative_tokens":'"${NUM_SPEC_TOKENS:-3}"'}')
-        info "Preset: Qwen3.8-27B-NVFP4 (unsloth, compressed-tensors, speculative mtp)"
-    else
-        info "Preset: Qwen3.8-27B-NVFP4 (unsloth, compressed-tensors, MTP DISABLED)"
+    case "${SPEC_METHOD:-dspark}" in
+        none)
+            info "Preset: Qwen3.8-27B-NVFP4 (unsloth, compressed-tensors, speculative decoding DISABLED)"
+            ;;
+        mtp)
+            # Model ships its own MTP head (model_mtp.safetensors,
+            # mtp_num_hidden_layers=1 in config.json) — same self-contained
+            # MTP as the Qwen3.5 presets.
+            spec_args=(--speculative-config '{"method":"mtp","num_speculative_tokens":'"${NUM_SPEC_TOKENS:-3}"'}')
+            info "Preset: Qwen3.8-27B-NVFP4 (unsloth, compressed-tensors, speculative mtp)"
+            ;;
+        dspark)
+            local dspark_model="${QWEN38_DSPARK_MODEL:-${HOME}/models/Qwen3.8-27B-DSpark-vllm-compat}"
+            [[ -d "${dspark_model}" ]] || die "DSpark compat model not found at ${dspark_model}. See REBASE_20260814_BUGS.md for the one-time local-copy setup, or set SPEC_METHOD=mtp / SPEC_METHOD=none."
+            spec_args=(--speculative-config '{"model":"'"${dspark_model}"'","num_speculative_tokens":'"${NUM_SPEC_TOKENS:-7}"'}')
+            info "Preset: Qwen3.8-27B-NVFP4 (unsloth, compressed-tensors, speculative DSpark)"
+            ;;
+        *)
+            die "Unknown SPEC_METHOD=${SPEC_METHOD}. Valid: dspark, mtp, none."
+            ;;
+    esac
+    # DISABLE_MTP=1 kept as a back-compat alias for SPEC_METHOD=none.
+    if [[ "${DISABLE_MTP:-}" == "1" ]]; then
+        spec_args=()
+        info "DISABLE_MTP=1: speculative decoding DISABLED (overrides SPEC_METHOD)"
     fi
 
     info "  Model : ${model}"
@@ -434,7 +484,7 @@ cmd_qwen38() {
         --served-model-name qwen38 \
         --quantization compressed-tensors \
         --kv-cache-dtype fp8 \
-        --gpu-memory-utilization "${GPU_MEM_UTIL:-0.8}" \
+        --gpu-memory-utilization "${GPU_MEM_UTIL:-0.85}" \
         --max-model-len "${ctx}" \
         --max-num-seqs "${MAX_NUM_SEQS:-8}" \
         --attention-backend "${ATTENTION_BACKEND:-flashinfer}" \
@@ -573,6 +623,8 @@ Model path overrides:
   QWEN35_MODEL=<path>              Override Qwen3.5-NVFP4 snapshot path
   QWEN35_35B_MODEL=<path>          Override Qwen3.5-35B-NVFP4 model
   QWEN38_MODEL=<path>               Override qwen38 (Qwen3.8-27B-NVFP4) model
+  SPEC_METHOD=dspark|mtp|none        qwen38 speculative method (default dspark)
+  QWEN38_DSPARK_MODEL=<path>        Override qwen38's DSpark compat model path
   QWEN3_CODER_NVFP4_MODEL=<path>  Override Qwen3-Coder-Next-NVFP4 model
   QWEN3_CODER_MODEL=<path>        Override Qwen3-Coder-Next-FP8 model
   MINIMAX_MODEL=<path>             Override MiniMax model path
