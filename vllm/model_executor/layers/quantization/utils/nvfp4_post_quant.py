@@ -24,11 +24,12 @@ class Fp4PostQuantLinearMethod:
     """Minimal quant_method adapter for post-quantized NVFP4 linear layers.
 
     Installed by ``post_quantize_linear_to_nvfp4`` after packing the BF16
-    weight into NVFP4 format. Dispatches ``apply`` to ``apply_nvfp4_linear``.
+    weight into NVFP4 format. Dispatches ``apply`` to the kernel's
+    ``apply_weights`` (see ``vllm.model_executor.kernels.linear``).
     """
 
-    def __init__(self, backend):
-        self.backend = backend
+    def __init__(self, kernel):
+        self.kernel = kernel
 
     def apply(
         self,
@@ -36,22 +37,13 @@ class Fp4PostQuantLinearMethod:
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
-            apply_nvfp4_linear,
-        )
-
-        return apply_nvfp4_linear(
-            backend=self.backend,
-            layer=layer,
-            x=x,
-            bias=bias,
-        )
+        return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         pass  # weights are already prepared
 
 
-def post_quantize_linear_to_nvfp4(layer: nn.Module, name: str, backend) -> bool:
+def post_quantize_linear_to_nvfp4(layer: nn.Module, name: str, kernel) -> bool:
     """Post-quantize a BF16/FP16 linear layer to NVFP4 in-place.
 
     Converts the dense BF16 weight into packed FP4 uint8 format with block
@@ -60,8 +52,8 @@ def post_quantize_linear_to_nvfp4(layer: nn.Module, name: str, backend) -> bool:
     Returns True if quantization was applied, False if skipped.
     """
     from vllm._custom_ops import scaled_fp4_quant
-    from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
-        convert_to_nvfp4_linear_kernel_format,
+    from vllm.model_executor.layers.fusion.quant_activation import (
+        expose_input_quant_key,
     )
 
     weight = layer.weight.data
@@ -108,10 +100,11 @@ def post_quantize_linear_to_nvfp4(layer: nn.Module, name: str, backend) -> bool:
     layer.input_size_per_partition = input_size
 
     # Convert to kernel-specific format
-    convert_to_nvfp4_linear_kernel_format(backend, layer)
+    kernel.process_weights_after_loading(layer)
 
     # Replace quant_method with the NVFP4 adapter
-    layer.quant_method = Fp4PostQuantLinearMethod(backend)
+    layer.quant_method = Fp4PostQuantLinearMethod(kernel)
+    expose_input_quant_key(layer, kernel)
 
     logger.info(
         "Post-quantized %s to NVFP4: [%d, %d] BF16 (%.1f MB) → FP4 (%.1f MB)",
@@ -142,11 +135,9 @@ def apply_nvfp4_post_quant(model: nn.Module, layer_patterns: list[str]) -> int:
     if not current_platform.has_device_capability(120):
         return 0
 
-    from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
-        select_nvfp4_linear_backend,
-    )
+    from vllm.model_executor.kernels.linear import init_nvfp4_linear_kernel
 
-    backend = select_nvfp4_linear_backend()
+    kernel = init_nvfp4_linear_kernel()
     count = 0
 
     for name, module in model.named_modules():
@@ -154,7 +145,7 @@ def apply_nvfp4_post_quant(model: nn.Module, layer_patterns: list[str]) -> int:
             continue
         if not any(name.endswith(pat) for pat in layer_patterns):
             continue
-        if post_quantize_linear_to_nvfp4(module, name, backend):
+        if post_quantize_linear_to_nvfp4(module, name, kernel):
             count += 1
 
     if count > 0:

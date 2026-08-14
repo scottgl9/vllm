@@ -118,6 +118,21 @@ def prepare_fp8_layer_for_marlin(
     if input_dtype is not None and input_dtype.itemsize == 1:
         raise RuntimeError("Marlin W8A8 is not supported.")
 
+    # GB10 (SM121): with VLLM_TEST_FORCE_FP8_MARLIN=1 (required here since GB10
+    # lacks native FP8 hardware support), this kernel gets selected for *any*
+    # compressed-tensors FP8 layer, including an FP8-quantized lm_head
+    # (ParallelLMHead/VocabParallelEmbedding), which uses
+    # num_embeddings_per_partition/embedding_dim instead of the LinearBase-family
+    # output_size_per_partition/input_size_per_partition this function assumes.
+    # By this point CompressedTensorsW8A8Fp8.process_weights_after_loading has
+    # already transposed layer.weight to (K, N) [input, output] regardless of
+    # layer type (weight = weight.t(); input_dim=0, output_dim=1), matching
+    # this function's default size_k_first=True convention. See
+    # REBASE_20260814_BUGS.md.
+    if not hasattr(layer, "output_size_per_partition"):
+        layer.input_size_per_partition = layer.weight.shape[0]
+        layer.output_size_per_partition = layer.weight.shape[1]
+
     part_size_n = layer.output_size_per_partition
     part_size_k = layer.input_size_per_partition
     weight_block_size = getattr(layer, "weight_block_size", None)

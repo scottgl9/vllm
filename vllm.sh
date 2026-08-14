@@ -33,7 +33,9 @@
 # Key environment overrides:
 #   MAX_MODEL_LEN              Context window tokens (default: 65536)
 #   VLLM_QUANTIZE_LM_HEAD=nvfp4  Post-quantize lm_head to NVFP4 (~15% speedup)
-#   VLLM_NVFP4_GEMM_BACKEND    marlin (default) | cutlass | flashinfer-cutlass
+#   LINEAR_BACKEND             marlin (default) | auto | cutlass | flashinfer_cutlass | ...
+#                              (--linear-backend flag; replaces the now-dead
+#                              VLLM_NVFP4_GEMM_BACKEND env var post-2026-08-14 rebase)
 #   VLLM_MTP_FP8=1             Post-quantize MTP fc/self_attn/mlp to FP8
 #                              (~849MB->~425MB on qwen38; see
 #                              QWEN38_FP8_POSTQUANT_ANALYSIS.md — fixed
@@ -65,7 +67,15 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 # ── Shared launch arg groups ──────────────────────────────────────────────────
 
 # Standard server binding (all presets)
-SERVER_ARGS=(--host 0.0.0.0 --port 8000)
+# --linear-backend marlin: as of the 2026-08-14 rebase, VLLM_NVFP4_GEMM_BACKEND
+# (previously set in setup_runtime_env) is no longer a recognized vLLM env var —
+# replaced by this CLI flag (vllm/model_executor/kernels/linear/__init__.py).
+# Forcing marlin here used to crash loading a compressed-tensors FP8 lm_head
+# (ParallelLMHead has no output_size_per_partition attribute — Marlin's FP8
+# prep code assumes a LinearBase-family layer); that's now patched in
+# gb10_compat.py's _patch_marlin_fp8_layer_shape_compat(). See
+# REBASE_20260814_BUGS.md.
+SERVER_ARGS=(--host 0.0.0.0 --port 8000 --linear-backend "${LINEAR_BACKEND:-marlin}")
 
 # Common to all Qwen3 presets: tool calling (served-model-name is per-preset —
 # it used to live here too, which mislabeled the Qwen3.5 presets as
@@ -116,8 +126,8 @@ setup_runtime_env() {
     export TORCH_COMPILE_THREADS=4
     export TORCHINDUCTOR_COMPILE_THREADS=4
 
-    # NVFP4 GEMM via Marlin (fastest on SM121); override with VLLM_NVFP4_GEMM_BACKEND
-    export VLLM_NVFP4_GEMM_BACKEND="${VLLM_NVFP4_GEMM_BACKEND:-marlin}"
+    # NVFP4 GEMM backend is now set via --linear-backend (SERVER_ARGS), not an
+    # env var — see the comment there.
     # Marlin atomic-add reduction (improves throughput on GB10)
     export VLLM_MARLIN_USE_ATOMIC_ADD=1
     # Force Marlin FP8 GEMM on SM121 (avoids CUTLASS FP8 issues on GB10).
@@ -125,6 +135,12 @@ setup_runtime_env() {
     # FlashInfer TRTLLM MoE FP4 is NOT supported on SM121 (GB10).
     # The TRTLLM kernel has a hardcoded C++ ICHECK_EQ(major, 10) that rejects SM12x
     # at runtime even after JIT compilation succeeds. Use Marlin MoE instead.
+    # TODO(2026-08-14 rebase): VLLM_USE_FLASHINFER_MOE_FP4 is ALSO no longer a
+    # recognized vLLM env var (same removal as VLLM_NVFP4_GEMM_BACKEND above) —
+    # this export is now silently a no-op. Doesn't affect qwen38 (dense, no MoE),
+    # but qwen35/122B, qwen35/35B, and laguna all route MoE experts and may be
+    # auto-selecting an unverified MoE backend on SM121 until this is replaced
+    # with the equivalent --moe-backend flag and re-verified on those presets.
     export VLLM_USE_FLASHINFER_MOE_FP4=0
     # Disable DeepGEMM (not supported on SM121)
     export VLLM_USE_DEEP_GEMM=0
@@ -294,7 +310,7 @@ cmd_launch() {
     setup_runtime_env
 
     info "Launching vLLM OpenAI-compatible server"
-    info "  VLLM_NVFP4_GEMM_BACKEND = ${VLLM_NVFP4_GEMM_BACKEND}"
+    info "  --linear-backend        = ${LINEAR_BACKEND:-marlin}"
     info "  VLLM_DRAFT_SAMPLE_OPT  = ${VLLM_DRAFT_SAMPLE_OPT:-none}"
     info "  VLLM_MTP_FP8           = ${VLLM_MTP_FP8:-0}"
     info "  VLLM_MTP_MOE_FP8       = ${VLLM_MTP_MOE_FP8:-0}"
@@ -344,7 +360,6 @@ cmd_qwen35_122b_nvfp4() {
         --enable-chunked-prefill \
         --max-num-batched-tokens "${MAX_BATCHED_TOKENS:-8192}" \
         --enable-prefix-caching \
-        --swap-space 0 \
         --language-model-only \
         --reasoning-parser qwen3 \
         --trust-remote-code \
@@ -379,7 +394,6 @@ cmd_qwen35_35b_nvfp4() {
         --enable-chunked-prefill \
         --max-num-batched-tokens "${MAX_BATCHED_TOKENS:-8192}" \
         --enable-prefix-caching \
-        --swap-space 0 \
         --safetensors-load-strategy eager \
         --language-model-only \
         --reasoning-parser qwen3 \
@@ -420,7 +434,7 @@ cmd_qwen38() {
         --served-model-name qwen38 \
         --quantization compressed-tensors \
         --kv-cache-dtype fp8 \
-        --gpu-memory-utilization "${GPU_MEM_UTIL:-0.92}" \
+        --gpu-memory-utilization "${GPU_MEM_UTIL:-0.8}" \
         --max-model-len "${ctx}" \
         --max-num-seqs "${MAX_NUM_SEQS:-8}" \
         --attention-backend "${ATTENTION_BACKEND:-flashinfer}" \
@@ -428,7 +442,6 @@ cmd_qwen38() {
         --enable-chunked-prefill \
         --max-num-batched-tokens "${MAX_BATCHED_TOKENS:-8192}" \
         --enable-prefix-caching \
-        --swap-space 0 \
         --safetensors-load-strategy eager \
         --language-model-only \
         --reasoning-parser qwen3 \
@@ -569,7 +582,7 @@ Model path overrides:
 Environment overrides:
   MAX_MODEL_LEN=N              Context window tokens (default: 65536)
   VLLM_QUANTIZE_LM_HEAD=nvfp4  Post-quantize lm_head to NVFP4 (~15% speedup)
-  VLLM_NVFP4_GEMM_BACKEND=...  marlin (default) | cutlass | flashinfer-cutlass
+  LINEAR_BACKEND=...           marlin (default) | auto | cutlass | flashinfer_cutlass | ...
   VLLM_MTP_FP8=1               Post-quantize MTP fc/self_attn/mlp to FP8
                                 (default on for qwen38)
 
