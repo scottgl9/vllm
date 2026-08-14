@@ -7,6 +7,7 @@
 #   shell                          Drop into an activated venv shell
 #   Qwen3.5-NVFP4 [args]          Qwen3.5-122B MoE NVFP4 + speculative decoding
 #   Qwen3.5-35B-NVFP4 [args]      Qwen3.5-35B-A3B MoE NVFP4 + speculative decoding
+#   qwen38 [args]                  Qwen3.8-27B-NVFP4 (unsloth) + MTP, 262k context
 #   Qwen3-Coder-Next-NVFP4 [args] GadflyII Qwen3-Coder-Next NVFP4
 #   Qwen3-Coder-Next-FP8 [args]   Qwen/Qwen3-Coder-Next dense FP8
 #   minimax [args]                 MiniMax M2.5 REAP 139B NVFP4
@@ -22,6 +23,7 @@
 # Model path overrides:
 #   QWEN35_MODEL=/path/to/snapshot               ./vllm.sh Qwen3.5-NVFP4
 #   QWEN35_35B_MODEL=Sehyo/Qwen3.5-35B-A3B-NVFP4 ./vllm.sh Qwen3.5-35B-NVFP4
+#   QWEN38_MODEL=unsloth/Qwen3.8-27B-NVFP4        ./vllm.sh qwen38
 #   QWEN3_CODER_NVFP4_MODEL=GadflyII/...         ./vllm.sh Qwen3-Coder-Next-NVFP4
 #   QWEN3_CODER_MODEL=Qwen/Qwen3-Coder-Next-FP8  ./vllm.sh Qwen3-Coder-Next-FP8
 #   MINIMAX_MODEL=/path/to/model                  ./vllm.sh minimax
@@ -382,6 +384,49 @@ cmd_qwen35_35b_nvfp4() {
         "$@"
 }
 
+cmd_qwen38() {
+    local model="${QWEN38_MODEL:-unsloth/Qwen3.8-27B-NVFP4}"
+    # Qwen3.8-27B-NVFP4's native context (262144, config.json max_position_embeddings)
+    # differs from the script-wide default (131072) — same MAX_MODEL_LEN_RAW
+    # fallback pattern as laguna, so an explicit MAX_MODEL_LEN isn't clobbered.
+    local ctx="${MAX_MODEL_LEN_RAW:-262144}"
+
+    local spec_args=()
+    if [[ "${DISABLE_MTP:-}" != "1" ]]; then
+        # Model ships its own MTP head (model_mtp.safetensors, mtp_num_hidden_layers=1
+        # in config.json) — same self-contained MTP as the Qwen3.5 presets.
+        spec_args=(--speculative-config '{"method":"mtp","num_speculative_tokens":'"${NUM_SPEC_TOKENS:-3}"'}')
+        info "Preset: Qwen3.8-27B-NVFP4 (unsloth, compressed-tensors, speculative mtp)"
+    else
+        info "Preset: Qwen3.8-27B-NVFP4 (unsloth, compressed-tensors, MTP DISABLED)"
+    fi
+
+    info "  Model : ${model}"
+    info "  MaxLen: ${ctx}"
+
+    cmd_launch \
+        --model "${model}" \
+        --served-model-name qwen38 \
+        --quantization compressed-tensors \
+        --kv-cache-dtype fp8 \
+        --gpu-memory-utilization "${GPU_MEM_UTIL:-0.92}" \
+        --max-model-len "${ctx}" \
+        --max-num-seqs "${MAX_NUM_SEQS:-8}" \
+        --attention-backend "${ATTENTION_BACKEND:-flashinfer}" \
+        "${spec_args[@]}" \
+        --enable-chunked-prefill \
+        --max-num-batched-tokens "${MAX_BATCHED_TOKENS:-8192}" \
+        --enable-prefix-caching \
+        --swap-space 0 \
+        --safetensors-load-strategy eager \
+        --language-model-only \
+        --reasoning-parser qwen3 \
+        --trust-remote-code \
+        "${SERVER_ARGS[@]}" \
+        "${QWEN3_ARGS[@]}" \
+        "$@"
+}
+
 cmd_qwen3_coder_next_nvfp4() {
     local model="${QWEN3_CODER_NVFP4_MODEL:-GadflyII/Qwen3-Coder-Next-NVFP4}"
     local ctx="${MAX_MODEL_LEN:-131072}"
@@ -491,6 +536,7 @@ Commands:
 
   Qwen3.5-NVFP4 [args]          Qwen3.5-122B MoE NVFP4, speculative decoding
   Qwen3.5-35B-NVFP4 [args]      Qwen3.5-35B-A3B MoE NVFP4, speculative decoding
+  qwen38 [args]                  Qwen3.8-27B-NVFP4 (unsloth), MTP, 262k context
   Qwen3-Coder-Next-NVFP4 [args] GadflyII/Qwen3-Coder-Next-NVFP4
   Qwen3-Coder-Next-FP8 [args]   Qwen/Qwen3-Coder-Next-FP8
   minimax [args]                 MiniMax M2.5 REAP 139B NVFP4
@@ -502,6 +548,7 @@ Context window (default: ${MAX_MODEL_LEN}):
 Model path overrides:
   QWEN35_MODEL=<path>              Override Qwen3.5-NVFP4 snapshot path
   QWEN35_35B_MODEL=<path>          Override Qwen3.5-35B-NVFP4 model
+  QWEN38_MODEL=<path>               Override qwen38 (Qwen3.8-27B-NVFP4) model
   QWEN3_CODER_NVFP4_MODEL=<path>  Override Qwen3-Coder-Next-NVFP4 model
   QWEN3_CODER_MODEL=<path>        Override Qwen3-Coder-Next-FP8 model
   MINIMAX_MODEL=<path>             Override MiniMax model path
@@ -532,6 +579,7 @@ case "${CMD}" in
     shell)   cmd_shell ;;
     Qwen3.5-NVFP4|qwen3.5-nvfp4|qwen35-nvfp4) cmd_qwen35_122b_nvfp4 "$@" ;;
     Qwen3.5-35B-NVFP4|qwen35-35b-nvfp4) cmd_qwen35_35b_nvfp4 "$@" ;;
+    qwen38|Qwen3.8-NVFP4|qwen3.8-nvfp4) cmd_qwen38 "$@" ;;
     Qwen3-Coder-Next-NVFP4|qwen3-coder-next-nvfp4) cmd_qwen3_coder_next_nvfp4 "$@" ;;
     Qwen3-Coder-Next-FP8|qwen3-coder-next-fp8) cmd_qwen3_coder_next_fp8 "$@" ;;
     minimax|MiniMax) cmd_minimax "$@" ;;
