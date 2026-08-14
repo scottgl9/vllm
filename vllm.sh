@@ -34,6 +34,10 @@
 #   MAX_MODEL_LEN              Context window tokens (default: 65536)
 #   VLLM_QUANTIZE_LM_HEAD=nvfp4  Post-quantize lm_head to NVFP4 (~15% speedup)
 #   VLLM_NVFP4_GEMM_BACKEND    marlin (default) | cutlass | flashinfer-cutlass
+#   VLLM_MTP_FP8=1             Post-quantize MTP fc/self_attn/mlp to FP8
+#                              (~849MB->~425MB on qwen38; see
+#                              QWEN38_FP8_POSTQUANT_ANALYSIS.md — fixed
+#                              2026-08-14, was previously a silent no-op)
 #
 # Slow model loading on GB10 (safetensors mmap is slow due to ARM SMMU):
 #   --safetensors-load-strategy eager   ~6x faster than mmap (8m41s → 1m28s)
@@ -566,6 +570,8 @@ Environment overrides:
   MAX_MODEL_LEN=N              Context window tokens (default: 65536)
   VLLM_QUANTIZE_LM_HEAD=nvfp4  Post-quantize lm_head to NVFP4 (~15% speedup)
   VLLM_NVFP4_GEMM_BACKEND=...  marlin (default) | cutlass | flashinfer-cutlass
+  VLLM_MTP_FP8=1               Post-quantize MTP fc/self_attn/mlp to FP8
+                                (default on for qwen38)
 
 Examples:
   ./vllm.sh Qwen3.5-NVFP4
