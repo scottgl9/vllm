@@ -96,6 +96,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.fc = ColumnParallelLinear(
             self.config.hidden_size * 2,
             self.config.hidden_size,
+            gather_output=True,
             bias=False,
             return_bias=False,
             quant_config=fc_quant,
@@ -152,7 +153,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
             hidden_states = self.pre_fc_norm_hidden(hidden_states)
             hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-            hidden_states, _ = self.fc(hidden_states)
+            hidden_states = self.fc(hidden_states)
             residual = None
         else:
             assert intermediate_tensors is not None
